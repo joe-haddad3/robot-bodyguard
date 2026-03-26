@@ -6,14 +6,17 @@ from aggression_analyzer import AggressionAnalyzer
 
 
 class EnhancedThreatAnalyzer:
-    def __init__(self):
+    def __init__(self, rpi_mode=False):
         self.threat_history = defaultdict(list)
         self.owner_distance_history = defaultdict(list)
 
+        pose_every_n = 20 if rpi_mode else 12
+        min_crop_size = 60 if rpi_mode else 100
+
         self.behavior_analyzer = BehaviorAnalyzer(
-            pose_every_n=12,
+            pose_every_n=pose_every_n,
             velocity_window=10,
-            min_crop_size=100,
+            min_crop_size=min_crop_size,
             pose_model_complexity=0,
         )
 
@@ -26,21 +29,21 @@ class EnhancedThreatAnalyzer:
         }
 
         self.WEAPON_WEIGHTS = {
-            "gun": 12,
-            "knife": 10,
-            "hammer": 8,
-            "baseball_bat": 5,
+            "gun": 22,           # gun alone must reach THREAT
+            "knife": 18,         # knife alone must reach THREAT
+            "hammer": 12,
+            "baseball_bat": 8,
         }
 
         self.WEAPON_THRESHOLDS = {
-            "gun": 0.75,
-            "knife": 0.4,
-            "hammer": 0.5,
-            "baseball_bat": 0.5,
+            "gun": 0.65,         # slightly easier to trigger (was 0.75)
+            "knife": 0.50,       # match entry threshold (was 0.4 — too loose)
+            "hammer": 0.50,
+            "baseball_bat": 0.50,
         }
 
-        self.SUSPICIOUS_THRESHOLD = 10
-        self.THREAT_THRESHOLD = 20
+        self.SUSPICIOUS_THRESHOLD = 8    # catch approaching / raised arms (was 10)
+        self.THREAT_THRESHOLD = 18       # weapon alone pushes past this (was 20)
 
     def cleanup_missing_tracks(self, active_track_ids):
         active_track_ids = set(active_track_ids)

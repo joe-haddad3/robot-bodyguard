@@ -1,10 +1,40 @@
 import cv2
 import math
+import os
+import urllib.request
 from collections import deque
 
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import vision
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_MODEL_DIR = os.path.join(_BASE_DIR, "models", "aggression")
+
+_MODELS = {
+    "face_landmarker.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    ),
+    "hand_landmarker.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    ),
+    "pose_landmarker.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    ),
+}
+
+
+def _ensure_models():
+    os.makedirs(_MODEL_DIR, exist_ok=True)
+    for filename, url in _MODELS.items():
+        path = os.path.join(_MODEL_DIR, filename)
+        if not os.path.exists(path):
+            print(f"[AggressionAnalyzer] Downloading {filename}...")
+            urllib.request.urlretrieve(url, path)
+            print(f"[AggressionAnalyzer] {filename} ready.")
 
 
 def clamp(x, lo=0.0, hi=1.0):
@@ -24,11 +54,16 @@ def euclidean(p1, p2):
 class AggressionAnalyzer:
     def __init__(
         self,
-        face_model_path="models/aggression/face_landmarker.task",
-        hand_model_path="models/aggression/hand_landmarker.task",
-        pose_model_path="models/aggression/pose_landmarker.task",
+        face_model_path=None,
+        hand_model_path=None,
+        pose_model_path=None,
         smooth_history=5
     ):
+        _ensure_models()
+        face_model_path = face_model_path or os.path.join(_MODEL_DIR, "face_landmarker.task")
+        hand_model_path = hand_model_path or os.path.join(_MODEL_DIR, "hand_landmarker.task")
+        pose_model_path = pose_model_path or os.path.join(_MODEL_DIR, "pose_landmarker.task")
+
         BaseOptions = mp.tasks.BaseOptions
         VisionRunningMode = vision.RunningMode
 

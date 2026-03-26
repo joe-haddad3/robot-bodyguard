@@ -1,7 +1,28 @@
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
 import time
+import urllib.request
+import os
+
+# Landmark indices (same values as the old PoseLandmark enum)
+NOSE = 0
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
+LEFT_WRIST = 15
+RIGHT_WRIST = 16
+LEFT_HIP = 23
+RIGHT_HIP = 24
+LEFT_KNEE = 25
+RIGHT_KNEE = 26
+
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+)
+_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 
 
 class BehaviorAnalyzer:
@@ -10,15 +31,23 @@ class BehaviorAnalyzer:
         pose_every_n=3,
         velocity_window=10,
         min_crop_size=80,
-        pose_model_complexity=0,
+        pose_model_complexity=0,  # kept for API compatibility, unused
     ):
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=pose_model_complexity,
-            min_detection_confidence=0.5,
+        if not os.path.exists(_MODEL_PATH):
+            print("[BehaviorAnalyzer] Downloading pose model (~5 MB)...")
+            urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+            print("[BehaviorAnalyzer] Download complete.")
+
+        base_options = mp_python.BaseOptions(model_asset_path=_MODEL_PATH)
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
             min_tracking_confidence=0.4,
         )
+        self.detector = mp_vision.PoseLandmarker.create_from_options(options)
         self.position_history = {}
         self.pose_every_n = pose_every_n
         self.velocity_window = velocity_window
@@ -74,21 +103,24 @@ class BehaviorAnalyzer:
             return min(score, 10), behaviors
 
         rgb_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(rgb_crop)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_crop)
+        results = self.detector.detect(mp_image)
 
         pose_score = 0
         pose_behaviors = []
 
         if results.pose_landmarks:
-            if self._has_raised_arms(results.pose_landmarks):
+            landmarks = results.pose_landmarks[0]  # first detected pose
+
+            if self._has_raised_arms(landmarks):
                 pose_score += 5
                 pose_behaviors.append("Raised arms")
 
-            if self._is_lunging_forward(results.pose_landmarks):
+            if self._is_lunging_forward(landmarks):
                 pose_score += 4
                 pose_behaviors.append("Lunging forward")
 
-            if self._is_running(results.pose_landmarks):
+            if self._is_running(landmarks):
                 pose_score += 3
                 pose_behaviors.append("Running")
 
@@ -101,23 +133,18 @@ class BehaviorAnalyzer:
         return min(score, 10), behaviors
 
     def _has_raised_arms(self, landmarks):
-        left_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
-        left_wrist = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_WRIST]
-        right_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
-        right_wrist = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_WRIST]
-        return (left_wrist.y < left_shoulder.y) and (right_wrist.y < right_shoulder.y)
+        return (
+            landmarks[LEFT_WRIST].y < landmarks[LEFT_SHOULDER].y
+            and landmarks[RIGHT_WRIST].y < landmarks[RIGHT_SHOULDER].y
+        )
 
     def _is_lunging_forward(self, landmarks):
-        nose = landmarks.landmark[self.mp_pose.PoseLandmark.NOSE]
-        left_hip = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_HIP]
-        right_hip = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_HIP]
-        hip_center_y = (left_hip.y + right_hip.y) / 2
+        nose = landmarks[NOSE]
+        hip_center_y = (landmarks[LEFT_HIP].y + landmarks[RIGHT_HIP].y) / 2
         return nose.y < hip_center_y - 0.2
 
     def _is_running(self, landmarks):
-        left_knee = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_KNEE]
-        right_knee = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_KNEE]
-        return abs(left_knee.y - right_knee.y) > 0.15
+        return abs(landmarks[LEFT_KNEE].y - landmarks[RIGHT_KNEE].y) > 0.15
 
     def _calculate_velocity(self, bbox, track_id):
         center_x = (bbox[0] + bbox[2]) / 2

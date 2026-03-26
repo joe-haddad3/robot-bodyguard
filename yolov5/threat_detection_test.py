@@ -2,6 +2,7 @@ import cv2
 import torch
 import math
 import time
+import os
 from collections import deque, defaultdict
 
 from enhanced_threat_analyzer import EnhancedThreatAnalyzer
@@ -10,15 +11,26 @@ from owner_recognizer_facenet import FaceNetOwnerRecognizer
 
 
 # -----------------------------
+# PLATFORM MODE
+# Set RPI_MODE = True when running on Raspberry Pi 5
+# -----------------------------
+RPI_MODE = False
+# -----------------------------
 # CAMERA / MODEL SETTINGS
 # -----------------------------
-CAMERA_INDEX = 1   # change if needed
+CAMERA_INDEX = 0  # change if needed (RPi camera module: usually 0)
 CAM_W = 640
 CAM_H = 480
 CAM_FPS = 15
 YOLO_EVERY = 2
 
-MODEL_PATH = "best.pt"
+if RPI_MODE:
+    CAM_W = 320
+    CAM_H = 240
+    CAM_FPS = 10
+    YOLO_EVERY = 5
+
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 
 cam = LatestFrameCamera(
     src=CAMERA_INDEX,
@@ -28,7 +40,7 @@ cam = LatestFrameCamera(
 ).start()
 
 model = torch.hub.load(
-    ".",
+    os.path.dirname(os.path.abspath(__file__)),
     "custom",
     path=MODEL_PATH,
     source="local",
@@ -65,10 +77,10 @@ ENTRY_THRESHOLDS = {
 
 KEEP_THRESHOLDS = {
     "person": 0.20,
-    "knife": 0.50,
-    "gun": 0.50,
-    "baseball_bat": 0.35,
-    "hammer": 0.35,
+    "knife": 0.35,    # once detected at 0.50, keep tracking at lower conf (no flickering)
+    "gun": 0.40,      # same logic for gun
+    "baseball_bat": 0.30,
+    "hammer": 0.30,
 }
 
 PERSON_MISSING_FRAMES = 40
@@ -76,10 +88,10 @@ OBJECT_MISSING_FRAMES = 15
 
 CLASS_CONFIRM_FRAMES = {
     "person": 1,
-    "knife": 1,
+    "knife": 2,    # must appear in 2 frames before tracking — reduces false knife alerts
     "gun": 2,
-    "baseball_bat": 1,
-    "hammer": 1,
+    "baseball_bat": 2,
+    "hammer": 2,
 }
 
 CLASS_SWITCH_CONFIRM_FRAMES = 2
@@ -99,10 +111,16 @@ FACE_MIN_SIZE = (60, 60)
 # -----------------------------
 OWNER_RECOGNITION_ENABLED = True
 OWNER_RECOGNITION_EVERY = 2
-OWNER_DISTANCE_THRESHOLD = 0.30
-OWNER_CONFIRM_FRAMES = 1
+OWNER_DISTANCE_THRESHOLD = 0.30   # enrolled samples score 0.02-0.15 vs mean; live ~2x; strangers ~0.50+
+OWNER_CONFIRM_FRAMES = 3          # must match 3 consecutive frames to avoid false positives
 FACE_EXPAND = 0.10
 MIN_OWNER_FACE_SIZE = 60
+
+if RPI_MODE:
+    # Face recognition is slow on CPU — run less often
+    OWNER_RECOGNITION_EVERY = 15
+    MIN_OWNER_FACE_SIZE = 30
+    FACE_MIN_SIZE = (30, 30)
 
 
 # -----------------------------
@@ -116,7 +134,7 @@ active_objects = {}
 object_class_history = {}
 switch_candidate_history = defaultdict(lambda: deque(maxlen=5))
 
-threat_analyzer = EnhancedThreatAnalyzer()
+threat_analyzer = EnhancedThreatAnalyzer(rpi_mode=RPI_MODE)
 recognized_owner_id = None
 
 owner_recognizer = FaceNetOwnerRecognizer(threshold=OWNER_DISTANCE_THRESHOLD)
@@ -710,19 +728,14 @@ while True:
                 used_detection_idxs.add(best_idx)
 
         if not owner_match_ok:
-            old_owner_id = recognized_owner_id
-
-            active_persons[old_owner_id]["owner_confirmed"] = False
-            active_persons[old_owner_id]["identity"] = "unknown"
-            active_persons[old_owner_id]["owner_match_streak"] = 0
-            active_persons[old_owner_id]["owner_distance"] = 999.0
-            active_persons[old_owner_id]["owner_label"] = "UNKNOWN"
-            active_persons[old_owner_id]["face_box_global"] = None
-
+            active_persons[recognized_owner_id]["owner_confirmed"] = False
+            active_persons[recognized_owner_id]["identity"] = "unknown"
+            active_persons[recognized_owner_id]["owner_match_streak"] = 0
+            active_persons[recognized_owner_id]["owner_distance"] = 999.0
+            active_persons[recognized_owner_id]["owner_label"] = "UNKNOWN"
+            active_persons[recognized_owner_id]["face_box_global"] = None
             recognized_owner_id = None
-
-            if old_owner_id in active_persons:
-                del active_persons[old_owner_id]
+            # track stays alive — normal PERSON_MISSING_FRAMES grace applies
 
     # 3B: match remaining detections to remaining tracks
     for i, det in enumerate(current_person_detections):
@@ -897,7 +910,6 @@ while True:
             "time_of_day": "day",
             "owner_bbox": owner_bbox,
             "owner_id": effective_owner_id,
-            "run_pose": (frame_count % 4 == 0),
         }
 
         threat_level, threat_score, explanation, debug = threat_analyzer.analyze_person(
