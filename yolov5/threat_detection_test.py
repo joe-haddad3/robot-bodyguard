@@ -8,8 +8,7 @@ from collections import deque, defaultdict
 from enhanced_threat_analyzer import EnhancedThreatAnalyzer
 from camera_utils import LatestFrameCamera
 from owner_recognizer_facenet import FaceNetOwnerRecognizer
-
-
+i=0
 # -----------------------------
 # PLATFORM MODE
 # Set RPI_MODE = True when running on Raspberry Pi 5
