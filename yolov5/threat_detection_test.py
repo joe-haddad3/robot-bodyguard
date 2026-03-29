@@ -13,7 +13,7 @@ from owner_recognizer_facenet import FaceNetOwnerRecognizer
 # PLATFORM MODE
 # Set RPI_MODE = True when running on Raspberry Pi 5
 # -----------------------------
-RPI_MODE = False
+RPI_MODE = True
 # -----------------------------
 # CAMERA / MODEL SETTINGS
 # -----------------------------
