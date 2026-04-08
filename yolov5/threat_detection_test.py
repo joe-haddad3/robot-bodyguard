@@ -68,17 +68,17 @@ WEAPON_CLASSES = {"knife", "gun", "baseball_bat", "hammer"}
 # -----------------------------
 ENTRY_THRESHOLDS = {
     "person": 0.50,
-    "knife": 0.50,
+    "knife": 0.7,
     "gun": 0.65,
-    "baseball_bat": 0.45,
+    "baseball_bat": 0.9,
     "hammer": 0.40,
 }
 
 KEEP_THRESHOLDS = {
     "person": 0.20,
     "knife": 0.35,    # once detected at 0.50, keep tracking at lower conf (no flickering)
-    "gun": 0.40,      # same logic for gun
-    "baseball_bat": 0.30,
+    "gun": 0.7,      # same logic for gun
+    "baseball_bat": 0.9,
     "hammer": 0.30,
 }
 
@@ -318,52 +318,11 @@ def maybe_switch_object_class(object_id, candidate_class, candidate_conf):
         switch_candidate_history[object_id].clear()
 
 
-def expand_face_box(face_box, frame_shape, expand_ratio=0.10):
-    x, y, w, h = face_box
-    H, W = frame_shape[:2]
-
-    pad_x = int(w * expand_ratio)
-    pad_y = int(h * expand_ratio)
-
-    x1 = max(0, x - pad_x)
-    y1 = max(0, y - pad_y)
-    x2 = min(W, x + w + pad_x)
-    y2 = min(H, y + h + pad_y)
-
-    return (x1, y1, x2, y2)
-
 
 def detect_faces_full_frame(frame_bgr):
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=FACE_MIN_SIZE
-    )
-
-    results = []
-    for (x, y, w, h) in faces:
-        if w < MIN_OWNER_FACE_SIZE or h < MIN_OWNER_FACE_SIZE:
-            continue
-
-        x1, y1, x2, y2 = expand_face_box((x, y, w, h), frame_bgr.shape, FACE_EXPAND)
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        face_crop_bgr = frame_bgr[y1:y2, x1:x2]
-        if face_crop_bgr.size == 0:
-            continue
-
-        results.append({
-            "face_box": (x1, y1, x2, y2),
-            "face_crop_bgr": face_crop_bgr,
-            "center": ((x1 + x2) / 2, (y1 + y2) / 2),
-            "raw_face": (x, y, w, h),
-        })
-
-    return results
+    # Use MTCNN (via owner_recognizer) for accurate detection + alignment.
+    # Returns face_tensor (pre-aligned, ready for FaceNet) instead of raw crop.
+    return owner_recognizer.detect_faces(frame_bgr)
 
 
 def match_faces_to_persons(detected_faces, persons):
@@ -449,10 +408,8 @@ def run_owner_recognition(frame):
 
         pdata["face_box_global"] = face_info["face_box"]
 
-        face_crop_bgr = face_info["face_crop_bgr"]
-        face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
-
-        result = owner_recognizer.recognize(face_crop_rgb)
+        # recognize_tensor uses the pre-aligned MTCNN tensor — much more accurate
+        result = owner_recognizer.recognize_tensor(face_info["face_tensor"])
 
         dist = float(result.get("distance", 999.0))
         is_owner = dist < OWNER_DISTANCE_THRESHOLD

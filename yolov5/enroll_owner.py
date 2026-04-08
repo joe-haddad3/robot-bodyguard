@@ -1,15 +1,20 @@
 """
 Run this script ONCE to enroll the owner's face.
-It opens the camera, captures face samples, and saves
-face_db/owner_embeddings.npy for FaceNetOwnerRecognizer.
+It opens the camera, captures face samples using MTCNN (face alignment),
+and saves face_db/owner_embeddings.npy for FaceNetOwnerRecognizer.
 
 Usage:
     python enroll_owner.py
 
 Controls:
-    SPACE  - capture a sample (aim for 30-50 samples)
+    SPACE  - capture a sample (aim for 30-50 samples, vary your head angle)
     S      - save and exit
     ESC    - exit without saving
+
+Tips for best recognition:
+    - Capture from multiple angles (left, right, up, down, straight)
+    - Vary lighting if possible
+    - Aim for 40+ samples
 """
 
 import os
@@ -18,13 +23,12 @@ import cv2
 import numpy as np
 from PIL import Image
 import torch
-from facenet_pytorch import InceptionResnetV1
+from facenet_pytorch import InceptionResnetV1, MTCNN
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_db")
 SAVE_PATH = os.path.join(SAVE_DIR, "owner_embeddings.npy")
-CAMERA_INDEX = 0     # change if your camera is on a different index
+CAMERA_INDEX = 0
 TARGET_SAMPLES = 40
-FACE_SIZE = (160, 160)
 
 
 def l2_normalize(v):
@@ -32,23 +36,21 @@ def l2_normalize(v):
     return v / n if n > 1e-10 else v
 
 
-def embed(model, face_rgb):
-    face_img = Image.fromarray(face_rgb).resize(FACE_SIZE)
-    face_np = np.asarray(face_img).astype(np.float32) / 255.0
-    face_np = (face_np - 0.5) / 0.5
-    tensor = torch.tensor(face_np).permute(2, 0, 1).unsqueeze(0).float()
-    with torch.no_grad():
-        emb = model(tensor).cpu().numpy()[0]
-    return l2_normalize(emb)
-
-
 def main():
-    print("[enroll_owner] Loading FaceNet model...")
-    model = InceptionResnetV1(pretrained="vggface2").eval()
+    print("[enroll_owner] Loading MTCNN + FaceNet models...")
 
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    # MTCNN aligns faces to standard eye positions before embedding.
+    # keep_all=False: only take the largest/closest face per frame.
+    mtcnn = MTCNN(
+        image_size=160,
+        margin=20,
+        keep_all=False,
+        min_face_size=80,
+        thresholds=[0.6, 0.7, 0.7],
+        post_process=True,
+        device="cpu",
     )
+    model = InceptionResnetV1(pretrained="vggface2").eval()
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -56,25 +58,46 @@ def main():
         sys.exit(1)
 
     embeddings = []
-    print(f"\n[enroll_owner] Camera open. Press SPACE to capture, S to save, ESC to quit.")
-    print(f"[enroll_owner] Aim for {TARGET_SAMPLES} samples.\n")
+    print(f"\n[enroll_owner] Camera open.")
+    print(f"[enroll_owner] SPACE=capture  S=save  ESC=quit")
+    print(f"[enroll_owner] Aim for {TARGET_SAMPLES} samples — vary your head angle!\n")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             continue
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame_rgb)
+
+        # Detect face bounding boxes for display
+        boxes, probs = mtcnn.detect(pil_img)
 
         display = frame.copy()
-        for (x, y, w, h) in faces:
-            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        face_found = False
 
+        if boxes is not None:
+            for box, prob in zip(boxes, probs):
+                if prob is None or prob < 0.85:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in box]
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(
+                    display, f"conf:{prob:.2f}",
+                    (x1, max(15, y1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
+                )
+                face_found = True
+
+        color = (0, 255, 255) if face_found else (0, 0, 255)
         status = f"Samples: {len(embeddings)}/{TARGET_SAMPLES}  |  SPACE=capture  S=save  ESC=quit"
-        cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.imshow("Enroll Owner", display)
+        cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+        if not face_found:
+            cv2.putText(display, "No face detected", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        cv2.imshow("Enroll Owner", display)
         key = cv2.waitKey(1) & 0xFF
 
         if key == 27:  # ESC
@@ -98,27 +121,24 @@ def main():
             break
 
         elif key == ord(" "):
-            if len(faces) == 0:
+            # Get MTCNN-aligned face tensor
+            face_tensor = mtcnn(pil_img)
+
+            if face_tensor is None:
                 print("[WARN] No face detected — move closer or improve lighting.")
                 continue
 
-            x, y, w, h = faces[0]
-            H, W = frame.shape[:2]
-            x1, y1 = max(0, x), max(0, y)
-            x2, y2 = min(W, x + w), min(H, y + h)
-            crop = frame[y1:y2, x1:x2]
+            # face_tensor: (3, 160, 160) — already aligned and normalized
+            with torch.no_grad():
+                emb = model(face_tensor.unsqueeze(0)).cpu().numpy()[0]
 
-            if crop.size == 0:
-                continue
-
-            rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            emb = embed(model, rgb_crop)
+            emb = l2_normalize(emb)
             embeddings.append(emb)
             print(f"[OK] Captured sample {len(embeddings)}")
 
-            # Flash green to confirm
+            # Flash green to confirm capture
             flash = display.copy()
-            cv2.rectangle(flash, (x1, y1), (x2, y2), (0, 255, 0), 6)
+            cv2.rectangle(flash, (0, 0), (frame.shape[1], frame.shape[0]), (0, 255, 0), 8)
             cv2.imshow("Enroll Owner", flash)
             cv2.waitKey(150)
 
