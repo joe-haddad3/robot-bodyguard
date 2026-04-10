@@ -114,6 +114,15 @@ class AggressionAnalyzer:
         self.prev_torso_center = None
         self.prev_timestamp_ms = None
 
+    def reset(self):
+        """Clear all history — call before reassigning this analyzer to a new track."""
+        for hist in (self.face_hist, self.hand_hist, self.pose_hist,
+                     self.motion_hist, self.final_hist,
+                     self.left_hand_center_hist, self.right_hand_center_hist):
+            hist.clear()
+        self.prev_torso_center = None
+        self.prev_timestamp_ms = None
+
     def _smooth(self, hist, value):
         hist.append(float(value))
         return avg(hist)

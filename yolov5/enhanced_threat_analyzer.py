@@ -1,5 +1,5 @@
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from behavior_analyzer import BehaviorAnalyzer
 from aggression_analyzer import AggressionAnalyzer
@@ -21,8 +21,16 @@ class EnhancedThreatAnalyzer:
         )
 
         self.rpi_mode = rpi_mode
-        # One AggressionAnalyzer per tracked person — each has its own
-        # history deques and MediaPipe VIDEO-mode state, so they never mix.
+
+        # Pre-create a pool of AggressionAnalyzers at startup so MediaPipe
+        # models load now (not mid-detection causing a freeze).
+        # Pool size = max simultaneous people before a new one is created on-demand.
+        _pool_size = 2 if rpi_mode else 4
+        print(f"[EnhancedThreatAnalyzer] Pre-warming {_pool_size} AggressionAnalyzers...")
+        self._aggression_pool = deque(AggressionAnalyzer() for _ in range(_pool_size))
+        print("[EnhancedThreatAnalyzer] Ready.")
+
+        # track_id -> AggressionAnalyzer (assigned from pool)
         self.aggression_analyzers = {}
         self.aggression_ts_counter = 0
 
@@ -61,7 +69,9 @@ class EnhancedThreatAnalyzer:
 
         for tid in list(self.aggression_analyzers.keys()):
             if tid not in active_track_ids:
-                del self.aggression_analyzers[tid]
+                freed = self.aggression_analyzers.pop(tid)
+                freed.reset()
+                self._aggression_pool.append(freed)
 
     def _bbox_center(self, bbox):
         x1, y1, x2, y2 = bbox
@@ -129,9 +139,13 @@ class EnhancedThreatAnalyzer:
         if not skip_aggression and x2 > x1 and y2 > y1:
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
-                # Get (or create) this person's private AggressionAnalyzer
+                # Get (or assign) this person's private AggressionAnalyzer
                 if track_id not in self.aggression_analyzers:
-                    self.aggression_analyzers[track_id] = AggressionAnalyzer()
+                    if self._aggression_pool:
+                        self.aggression_analyzers[track_id] = self._aggression_pool.popleft()
+                    else:
+                        # Pool exhausted — create a new one (rare: >pool_size people at once)
+                        self.aggression_analyzers[track_id] = AggressionAnalyzer()
                 analyzer = self.aggression_analyzers[track_id]
                 timestamp_ms = self._next_aggression_timestamp()
                 aggression_result = analyzer.analyze(crop, timestamp_ms)
