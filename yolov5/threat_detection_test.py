@@ -252,13 +252,14 @@ while True:
         changed_ratio = 1.0
     prev_gray_small = gray_s
 
-    if changed_ratio < MOTION_THRESHOLD:
-        # Nothing moving — show frame as-is, skip everything
+    if changed_ratio < MOTION_THRESHOLD and not active_persons:
+        # Nothing moving AND no one being tracked — skip everything
         cv2.putText(frame, "IDLE", (10,25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (120,120,120), 2)
         cv2.imshow("Threat Detection", frame)
         if cv2.waitKey(1) & 0xFF == 27: break
         continue
+    # If persons are already tracked, always continue even if scene is still
 
     # ── STEP 1 : YOLO — PERSON DETECTION ONLY ────────────────────────────────
     if frame_count % YOLO_EVERY == 0:
