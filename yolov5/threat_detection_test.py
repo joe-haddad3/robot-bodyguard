@@ -113,8 +113,8 @@ FACE_FALLBACK_ENABLED = True
 # -----------------------------
 OWNER_RECOGNITION_ENABLED = True
 OWNER_RECOGNITION_EVERY = 2
-OWNER_DISTANCE_THRESHOLD = 0.30   # enrolled samples score 0.02-0.15 vs mean; live ~2x; strangers ~0.50+
-OWNER_CONFIRM_FRAMES = 3          # must match 3 consecutive frames to avoid false positives
+OWNER_DISTANCE_THRESHOLD = 0.45   # 0.30 too strict for live vs photo enrollment; strangers ~0.55+
+OWNER_CONFIRM_FRAMES = 2          # consecutive matching frames needed to confirm owner
 FACE_EXPAND = 0.10
 MIN_OWNER_FACE_SIZE = 60
 
@@ -908,10 +908,9 @@ while True:
         info_lines.append(f"person_conf: {person_data['conf']:.2f}")
         info_lines.append(f"source: {person_data.get('source', 'yolo')}")
 
-        if person_data.get("owner_distance", 999.0) < 999.0:
-            info_lines.append(
-                f"owner_dist: {person_data['owner_distance']:.3f} | streak: {person_data.get('owner_match_streak', 0)}"
-            )
+        owner_dist = person_data.get("owner_distance", 999.0)
+        streak = person_data.get("owner_match_streak", 0)
+        info_lines.append(f"owner_dist: {owner_dist:.3f} | streak: {streak}")
 
         if assigned_weapons:
             weapon_text = ", ".join(
