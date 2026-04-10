@@ -21,8 +21,10 @@ class EnhancedThreatAnalyzer:
         )
 
         self.rpi_mode = rpi_mode
-        self.aggression_analyzer = AggressionAnalyzer()
-        self.aggression_ts_counter = 0  # <- important fix
+        # One AggressionAnalyzer per tracked person — each has its own
+        # history deques and MediaPipe VIDEO-mode state, so they never mix.
+        self.aggression_analyzers = {}
+        self.aggression_ts_counter = 0
 
         self.IDENTITY_WEIGHTS = {
             "owner": -20,
@@ -56,6 +58,10 @@ class EnhancedThreatAnalyzer:
         for tid in list(self.owner_distance_history.keys()):
             if tid not in active_track_ids:
                 del self.owner_distance_history[tid]
+
+        for tid in list(self.aggression_analyzers.keys()):
+            if tid not in active_track_ids:
+                del self.aggression_analyzers[tid]
 
     def _bbox_center(self, bbox):
         x1, y1, x2, y2 = bbox
@@ -123,9 +129,12 @@ class EnhancedThreatAnalyzer:
         if not skip_aggression and x2 > x1 and y2 > y1:
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
-                # strictly increasing for every call
+                # Get (or create) this person's private AggressionAnalyzer
+                if track_id not in self.aggression_analyzers:
+                    self.aggression_analyzers[track_id] = AggressionAnalyzer()
+                analyzer = self.aggression_analyzers[track_id]
                 timestamp_ms = self._next_aggression_timestamp()
-                aggression_result = self.aggression_analyzer.analyze(crop, timestamp_ms)
+                aggression_result = analyzer.analyze(crop, timestamp_ms)
                 aggression_score = float(aggression_result["aggression_score"])
                 aggression_points = aggression_score * 20.0
                 score += aggression_points
