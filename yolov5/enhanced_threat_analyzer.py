@@ -20,6 +20,7 @@ class EnhancedThreatAnalyzer:
             pose_model_complexity=0,
         )
 
+        self.rpi_mode = rpi_mode
         self.aggression_analyzer = AggressionAnalyzer()
         self.aggression_ts_counter = 0  # <- important fix
 
@@ -109,7 +110,17 @@ class EnhancedThreatAnalyzer:
         aggression_score = 0.0
         aggression_points = 0.0
 
-        if x2 > x1 and y2 > y1:
+        # Smart skip: if RPi mode and person has been consistently safe with no weapons,
+        # skip the expensive 3-model MediaPipe aggression analysis
+        prev_scores = self.threat_history.get(track_id, [])
+        skip_aggression = (
+            self.rpi_mode
+            and len(prev_scores) >= 4
+            and float(sum(prev_scores[-4:]) / 4) < 6.0
+            and weapon_score == 0
+        )
+
+        if not skip_aggression and x2 > x1 and y2 > y1:
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
                 # strictly increasing for every call
