@@ -55,10 +55,25 @@ class FaceNetOwnerRecognizer:
             self.model = None
             return
 
-        self.owner_embeddings = np.load(db_path)
+        try:
+            self.owner_embeddings = np.load(db_path)
+            if self.owner_embeddings.size == 0:
+                raise ValueError("Empty embeddings file")
+        except Exception as e:
+            print(f"[FaceNetOwnerRecognizer] WARNING: Could not load embeddings ({e}).\n"
+                  "  Owner recognition is DISABLED.\n"
+                  "  Run enroll_from_photos.py or enroll_owner.py to fix this.")
+            self.enabled = False
+            self.owner_embeddings = np.empty((0, 512), dtype=np.float32)
+            self.mean_embedding = None
+            self.model = None
+            return
 
         if os.path.exists(_DEFAULT_MEAN_PATH):
-            raw_mean = np.load(_DEFAULT_MEAN_PATH)
+            try:
+                raw_mean = np.load(_DEFAULT_MEAN_PATH)
+            except Exception:
+                raw_mean = self.owner_embeddings.mean(axis=0)
         else:
             raw_mean = self.owner_embeddings.mean(axis=0)
 

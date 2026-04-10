@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-_MODEL_ID = "dima806/face_mask_detection"   # ResNet-50, ~100 MB, fast on CPU
+_MODEL_ID = "Bingsu/acanet-mask-detector"   # ViT-based, verified on HuggingFace
 
 _pipe    = None
 _enabled = False
