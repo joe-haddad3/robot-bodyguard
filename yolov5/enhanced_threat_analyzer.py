@@ -39,8 +39,8 @@ class EnhancedThreatAnalyzer:
         self.mask_detector   = MaskDetector()
         self.mask_cache      = defaultdict(lambda: {"mask": False, "confidence": 0.0, "label": "UNKNOWN"})
         self.mask_frame_cnt  = defaultdict(int)
-        self.MASK_EVERY_N    = 15   # check mask every 15 frames per person
-        self.MASK_SCORE      = 10.0 # threat points added when mask detected
+        self.MASK_EVERY_N    = 10   # check concealment every 10 frames per person
+        self.MASK_SCORE      = 15.0 # threat points — concealed face alone → SUSPICIOUS
 
         self.IDENTITY_WEIGHTS = {
             "owner": -20,
@@ -241,7 +241,8 @@ class EnhancedThreatAnalyzer:
                 fx2 = min(W, x2); fy2 = min(H, y1 + int(0.40 * (y2 - y1)))
                 if fx2 > fx1 and fy2 > fy1:
                     face_crop = frame[fy1:fy2, fx1:fx2]
-                    mask_result = self.mask_detector.detect(face_crop)
+                    box_height = y2 - y1
+                    mask_result = self.mask_detector.detect(face_crop, person_box_height=box_height)
                     self.mask_cache[track_id] = mask_result
 
             if mask_result.get("mask", False):
