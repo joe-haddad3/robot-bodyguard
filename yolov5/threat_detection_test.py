@@ -116,7 +116,7 @@ FACE_FALLBACK_ENABLED = True
 # -----------------------------
 # OWNER RECOGNITION
 # -----------------------------
-OWNER_RECOGNITION_ENABLED = True
+OWNER_RECOGNITION_ENABLED = False
 OWNER_RECOGNITION_EVERY = 2
 OWNER_DISTANCE_THRESHOLD = 0.45   # 0.30 too strict for live vs photo enrollment; strangers ~0.55+
 OWNER_CONFIRM_FRAMES = 2          # consecutive matching frames needed to confirm owner
@@ -919,6 +919,11 @@ while True:
             info_lines.append(f"behavior: {debug.get('behavior_score', 0.0):.1f}")
             info_lines.append(f"owner_prox: {debug.get('owner_proximity_score', 0.0):.1f}")
             info_lines.append(f"robot_dist: {debug.get('robot_distance_score', 0.0):.1f}")
+            info_lines.append(
+                f"mask: {debug.get('mask_label','?')} "
+                f"({debug.get('mask_conf', 0.0):.2f}) "
+                f"+{debug.get('mask_score', 0.0):.0f}pts"
+            )
 
         info_lines.append(f"person_conf: {person_data['conf']:.2f}")
         info_lines.append(f"source: {person_data.get('source', 'yolo')}")

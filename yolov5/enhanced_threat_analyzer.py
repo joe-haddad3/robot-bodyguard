@@ -3,6 +3,7 @@ from collections import defaultdict, deque
 
 from behavior_analyzer import BehaviorAnalyzer
 from aggression_analyzer import AggressionAnalyzer
+from mask_detector import MaskDetector
 
 
 class EnhancedThreatAnalyzer:
@@ -33,6 +34,13 @@ class EnhancedThreatAnalyzer:
         # track_id -> AggressionAnalyzer (assigned from pool)
         self.aggression_analyzers = {}
         self.aggression_ts_counter = 0
+
+        # Mask detector — runs every N frames per person to avoid slowdown
+        self.mask_detector   = MaskDetector()
+        self.mask_cache      = defaultdict(lambda: {"mask": False, "confidence": 0.0, "label": "UNKNOWN"})
+        self.mask_frame_cnt  = defaultdict(int)
+        self.MASK_EVERY_N    = 15   # check mask every 15 frames per person
+        self.MASK_SCORE      = 10.0 # threat points added when mask detected
 
         self.IDENTITY_WEIGHTS = {
             "owner": -20,
@@ -72,6 +80,11 @@ class EnhancedThreatAnalyzer:
                 freed = self.aggression_analyzers.pop(tid)
                 freed.reset()
                 self._aggression_pool.append(freed)
+
+        for tid in list(self.mask_cache.keys()):
+            if tid not in active_track_ids:
+                del self.mask_cache[tid]
+                self.mask_frame_cnt.pop(tid, None)
 
     def _bbox_center(self, bbox):
         x1, y1, x2, y2 = bbox
@@ -150,7 +163,7 @@ class EnhancedThreatAnalyzer:
                 timestamp_ms = self._next_aggression_timestamp()
                 aggression_result = analyzer.analyze(crop, timestamp_ms)
                 aggression_score = float(aggression_result["aggression_score"])
-                aggression_points = aggression_score * 20.0
+                aggression_points = aggression_score * 8.0
                 score += aggression_points
 
         debug["aggression_score"] = aggression_score
@@ -214,6 +227,30 @@ class EnhancedThreatAnalyzer:
 
         score += owner_proximity_score
         debug["owner_proximity_score"] = owner_proximity_score
+
+        # ---------------- MASK SCORE ----------------
+        mask_score = 0.0
+        mask_result = self.mask_cache[track_id]
+
+        if self.mask_detector.enabled:
+            self.mask_frame_cnt[track_id] += 1
+            if self.mask_frame_cnt[track_id] % self.MASK_EVERY_N == 0:
+                # Crop face region = top 40% of person box
+                H, W = frame.shape[:2]
+                fx1 = max(0, x1); fy1 = max(0, y1)
+                fx2 = min(W, x2); fy2 = min(H, y1 + int(0.40 * (y2 - y1)))
+                if fx2 > fx1 and fy2 > fy1:
+                    face_crop = frame[fy1:fy2, fx1:fx2]
+                    mask_result = self.mask_detector.detect(face_crop)
+                    self.mask_cache[track_id] = mask_result
+
+            if mask_result.get("mask", False):
+                mask_score = self.MASK_SCORE
+
+        score += mask_score
+        debug["mask_score"]  = mask_score
+        debug["mask_label"]  = mask_result.get("label", "UNKNOWN")
+        debug["mask_conf"]   = mask_result.get("confidence", 0.0)
 
         # ---------------- FINAL SMOOTHING ----------------
         self.threat_history[track_id].append(score)
