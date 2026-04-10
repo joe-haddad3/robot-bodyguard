@@ -7,231 +7,546 @@ import torch
 import math
 import time
 import os
-import numpy as np
 from collections import deque, defaultdict
 
 from enhanced_threat_analyzer import EnhancedThreatAnalyzer
 from camera_utils import LatestFrameCamera
 from owner_recognizer_facenet import FaceNetOwnerRecognizer
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SETTINGS
-# ─────────────────────────────────────────────────────────────────────────────
-RPI_MODE      = False
-CAMERA_INDEX  = 0
-CAM_W, CAM_H  = 640, 480
-CAM_FPS       = 15
-YOLO_EVERY    = 2       # run YOLO every N frames
+# -----------------------------
+# PLATFORM MODE
+# Set RPI_MODE = True when running on Raspberry Pi 5
+# -----------------------------
+RPI_MODE = False
+# -----------------------------
+# CAMERA / MODEL SETTINGS
+# -----------------------------
+CAMERA_INDEX = 0  # change if needed (RPi camera module: usually 0)
+CAM_W = 640
+CAM_H = 480
+CAM_FPS = 15
+YOLO_EVERY = 2
 
 if RPI_MODE:
-    CAM_W, CAM_H = 320, 240
-    CAM_FPS      = 10
-    YOLO_EVERY   = 5
-
-# Motion gate — skip detection entirely when scene barely changed
-MOTION_THRESHOLD  = 0.10    # fraction of pixels that must change  (10 %)
-MOTION_PIXEL_DIFF = 15      # grey-level change counted as "moved"
-
-# Owner recognition
-OWNER_RECOGNITION_EVERY   = 2      # check every N frames (0 = every frame)
-OWNER_DISTANCE_THRESHOLD  = 0.45   # cosine distance; strangers ≈ 0.55+
-OWNER_CONFIRM_FRAMES      = 2      # consecutive hits to lock owner
-OWNER_FACE_REGION_FRAC    = 0.45   # top fraction of YOLO box = face region
-MIN_OWNER_FACE_SIZE       = 60     # min crop width (px) to attempt recognition
-
-if RPI_MODE:
-    OWNER_RECOGNITION_EVERY = 15
-    MIN_OWNER_FACE_SIZE     = 30
-
-# Detection thresholds
-ENTRY_THRESHOLDS = {
-    "person": 0.50, "knife": 0.70, "gun": 0.65,
-    "baseball_bat": 0.90, "hammer": 0.40,
-}
-KEEP_THRESHOLDS = {
-    "person": 0.20, "knife": 0.35, "gun": 0.70,
-    "baseball_bat": 0.90, "hammer": 0.30,
-}
-PERSON_MISSING_FRAMES = 40
-OBJECT_MISSING_FRAMES = 15
-CLASS_CONFIRM_FRAMES  = {
-    "person": 1, "knife": 2, "gun": 2, "baseball_bat": 2, "hammer": 2,
-}
-CLASS_SWITCH_CONFIRM_FRAMES = 2
-CLASS_PRIORITY = {"gun": 4, "knife": 3, "hammer": 2, "baseball_bat": 1}
-CLASS_NAMES    = {0: "person", 1: "knife", 2: "gun", 3: "baseball_bat", 4: "hammer"}
-WEAPON_CLASSES = {"knife", "gun", "baseball_bat", "hammer"}
+    CAM_W = 320
+    CAM_H = 240
+    CAM_FPS = 10
+    YOLO_EVERY = 5
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INITIALISE MODELS
-# ─────────────────────────────────────────────────────────────────────────────
-cam = LatestFrameCamera(src=CAMERA_INDEX, width=CAM_W, height=CAM_H, fps=CAM_FPS).start()
+cam = LatestFrameCamera(
+    src=CAMERA_INDEX,
+    width=CAM_W,
+    height=CAM_H,
+    fps=CAM_FPS
+).start()
 
 model = torch.hub.load(
     os.path.dirname(os.path.abspath(__file__)),
-    "custom", path=MODEL_PATH, source="local", force_reload=False,
+    "custom",
+    path=MODEL_PATH,
+    source="local",
+    force_reload=False
 )
+
 model.conf = 0.15
 
-threat_analyzer  = EnhancedThreatAnalyzer(rpi_mode=RPI_MODE)
+
+# -----------------------------
+# CLASS SETUP
+# -----------------------------
+CLASS_NAMES = {
+    0: "person",
+    1: "knife",
+    2: "gun",
+    3: "baseball_bat",
+    4: "hammer",
+}
+
+WEAPON_CLASSES = {"knife", "gun", "baseball_bat", "hammer"}
+
+
+# -----------------------------
+# THRESHOLDS
+# -----------------------------
+ENTRY_THRESHOLDS = {
+    "person": 0.65,   # raised from 0.50 — reduces false positives (coats, chairs, etc.)
+    "knife": 0.7,
+    "gun": 0.65,
+    "baseball_bat": 0.9,
+    "hammer": 0.40,
+}
+
+KEEP_THRESHOLDS = {
+    "person": 0.40,   # raised from 0.20 — drop track quickly if confidence falls
+    "knife": 0.35,
+    "gun": 0.7,
+    "baseball_bat": 0.9,
+    "hammer": 0.30,
+}
+
+# Person box must pass these checks to be accepted as a real person
+PERSON_MIN_HEIGHT  = 80    # pixels — filters tiny detections
+PERSON_MIN_WIDTH   = 40    # pixels
+PERSON_MIN_ASPECT  = 1.1   # height/width — people are taller than wide
+
+PERSON_MISSING_FRAMES = 40
+OBJECT_MISSING_FRAMES = 15
+
+CLASS_CONFIRM_FRAMES = {
+    "person": 1,
+    "knife": 2,    # must appear in 2 frames before tracking — reduces false knife alerts
+    "gun": 2,
+    "baseball_bat": 2,
+    "hammer": 2,
+}
+
+CLASS_SWITCH_CONFIRM_FRAMES = 2
+
+CLASS_PRIORITY = {
+    "gun": 4,
+    "knife": 3,
+    "hammer": 2,
+    "baseball_bat": 1,
+}
+
+FACE_FALLBACK_ENABLED = True
+
+# -----------------------------
+# OWNER RECOGNITION
+# -----------------------------
+OWNER_RECOGNITION_ENABLED = True
+OWNER_RECOGNITION_EVERY = 2
+OWNER_DISTANCE_THRESHOLD = 0.45   # 0.30 too strict for live vs photo enrollment; strangers ~0.55+
+OWNER_CONFIRM_FRAMES = 2          # consecutive matching frames needed to confirm owner
+FACE_EXPAND = 0.10
+MIN_OWNER_FACE_SIZE = 60
+
+if RPI_MODE:
+    # Face recognition is slow on CPU — run less often
+    OWNER_RECOGNITION_EVERY = 15
+    MIN_OWNER_FACE_SIZE = 30
+
+
+# -----------------------------
+# TRACKING STATE
+# -----------------------------
+next_person_id = 0
+next_object_id = 0
+
+active_persons = {}
+active_objects = {}
+object_class_history = {}
+switch_candidate_history = defaultdict(lambda: deque(maxlen=5))
+
+threat_analyzer = EnhancedThreatAnalyzer(rpi_mode=RPI_MODE)
+recognized_owner_id = None
+
 owner_recognizer = FaceNetOwnerRecognizer(threshold=OWNER_DISTANCE_THRESHOLD)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────────────────────────────────────
-next_person_id           = 0
-next_object_id           = 0
-active_persons           = {}   # pid  → person record
-active_objects           = {}   # oid  → object record
-object_class_history     = {}
-switch_candidate_history = defaultdict(lambda: deque(maxlen=5))
-recognized_owner_id      = None
-
-frame_count      = 0
-detections       = []           # last YOLO output
-prev_gray_small  = None         # motion gate reference frame
-changed_ratio    = 1.0          # last computed motion ratio
+frame_count = 0
+detections = []
 
 
-# =============================================================================
+# -----------------------------
 # HELPERS
-# =============================================================================
-def bbox_center(b):   return ((b[0]+b[2])/2, (b[1]+b[3])/2)
-def bbox_height(b):   return max(0, b[3]-b[1])
-def bbox_width(b):    return max(0, b[2]-b[0])
-def bbox_area(b):     return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+# -----------------------------
+def bbox_center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
 
-def dist2d(a, b):
-    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
 
-def iou(A, B):
-    ix1=max(A[0],B[0]); iy1=max(A[1],B[1])
-    ix2=min(A[2],B[2]); iy2=min(A[3],B[3])
-    iw=max(0,ix2-ix1); ih=max(0,iy2-iy1)
-    inter=iw*ih
-    if inter==0: return 0.0
-    denom=bbox_area(A)+bbox_area(B)-inter
-    return inter/denom if denom>0 else 0.0
+def bbox_area(box):
+    x1, y1, x2, y2 = box
+    return max(0, x2 - x1) * max(0, y2 - y1)
 
-def point_in_box(pt, b):
-    return b[0]<=pt[0]<=b[2] and b[1]<=pt[1]<=b[3]
+
+def bbox_width(box):
+    x1, y1, x2, y2 = box
+    return max(0, x2 - x1)
+
+
+def bbox_height(box):
+    x1, y1, x2, y2 = box
+    return max(0, y2 - y1)
+
+
+def distance(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+
+    if interArea == 0:
+        return 0.0
+
+    areaA = bbox_area(boxA)
+    areaB = bbox_area(boxB)
+    denom = areaA + areaB - interArea
+
+    if denom <= 0:
+        return 0.0
+
+    return interArea / denom
+
+
+def point_in_box(pt, box):
+    x, y = pt
+    x1, y1, x2, y2 = box
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def class_id_to_name(cls_id):
+    return CLASS_NAMES.get(cls_id, None)
+
+
+def confirm_needed(class_name):
+    return CLASS_CONFIRM_FRAMES.get(class_name, 1)
+
 
 def draw_text_block(frame, lines, x, y, color):
+    line_h = 18
     for i, line in enumerate(lines):
-        yy = y + i*18
-        if 0 < yy < frame.shape[0]-5:
-            cv2.putText(frame, line, (x, yy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        yy = y + i * line_h
+        if 0 < yy < frame.shape[0] - 5:
+            cv2.putText(
+                frame,
+                line,
+                (x, yy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1
+            )
 
-def match_to_tracks(box, tracks, iou_thr=0.25, dist_thr=250, skip=None):
-    skip = skip or set()
-    best_id=None; best_iou=-1
-    for tid,t in tracks.items():
-        if tid in skip: continue
-        ov=iou(box,t["bbox"])
-        if ov>=iou_thr and ov>best_iou: best_iou=ov; best_id=tid
-    if best_id: return best_id
-    best_d=float("inf")
-    for tid,t in tracks.items():
-        if tid in skip: continue
-        d=dist2d(bbox_center(box),bbox_center(t["bbox"]))
-        if d<dist_thr and d<best_d: best_d=d; best_id=tid
+
+def match_detection_to_tracks(det_box, tracks, iou_threshold=0.25, dist_threshold=250, skip_ids=None):
+    if skip_ids is None:
+        skip_ids = set()
+
+    best_id = None
+    best_score = -1
+
+    det_center = bbox_center(det_box)
+
+    for tid, t in tracks.items():
+        if tid in skip_ids:
+            continue
+        track_box = t["bbox"]
+        overlap = iou(det_box, track_box)
+        if overlap >= iou_threshold and overlap > best_score:
+            best_score = overlap
+            best_id = tid
+
+    if best_id is not None:
+        return best_id
+
+    best_dist = float("inf")
+    for tid, t in tracks.items():
+        if tid in skip_ids:
+            continue
+        track_center = bbox_center(t["bbox"])
+        d = distance(det_center, track_center)
+        if d < dist_threshold and d < best_dist:
+            best_dist = d
+            best_id = tid
+
     return best_id
 
-def smooth_box(old, new, a=0.7):
-    return [int(a*old[i]+(1-a)*new[i]) for i in range(4)]
 
-def update_person_track(pid, box, conf, source):
-    p=active_persons[pid]
-    p["bbox"]      = smooth_box(p["bbox"], box)
-    p["conf"]      = 0.8*p["conf"] + 0.2*conf
-    p["missing"]   = 0
-    p["seen_count"]+= 1
-    p["confirmed"] = True
-    p["source"]    = source
+def should_accept_new(class_name, conf):
+    return conf >= ENTRY_THRESHOLDS.get(class_name, 0.50)
 
-def maybe_switch_class(oid, cname, conf):
-    obj=active_objects[oid]; cur=obj["class_name"]
-    if cur==cname: switch_candidate_history[oid].clear(); return
-    if CLASS_PRIORITY.get(cname,0)<=CLASS_PRIORITY.get(cur,0):
-        switch_candidate_history[oid].clear(); return
-    if conf<ENTRY_THRESHOLDS.get(cname,0.5):
-        switch_candidate_history[oid].clear(); return
-    switch_candidate_history[oid].append(cname)
-    recent=list(switch_candidate_history[oid])[-CLASS_SWITCH_CONFIRM_FRAMES:]
-    if len(recent)==CLASS_SWITCH_CONFIRM_FRAMES and all(c==cname for c in recent):
-        obj["class_name"]=cname; switch_candidate_history[oid].clear()
 
-def make_hand_zone(b):
-    w=bbox_width(b); h=bbox_height(b)
-    return [int(b[0]-0.25*w), int(b[1]+0.18*h),
-            int(b[2]+0.25*w), int(b[1]+0.78*h)]
+def should_keep_existing(class_name, conf):
+    return conf >= KEEP_THRESHOLDS.get(class_name, 0.35)
 
-def weapon_match_score(wb, pb):
-    wc=bbox_center(wb)
-    s  = max(0.0, 2.0 - dist2d(wc,bbox_center(pb))/max(1,bbox_height(pb)))
-    s += 3.0*iou(wb,pb)
-    if point_in_box(wc,pb):           s += 1.5
-    if point_in_box(wc,make_hand_zone(pb)): s += 2.0
-    return s
 
-def assign_weapons(persons, objects):
-    out = {pid: [] for pid in persons}
-    conf_w = {oid:o for oid,o in objects.items()
-              if o.get("confirmed") and o.get("class_name") in WEAPON_CLASSES}
-    conf_p = {pid:p for pid,p in persons.items() if p.get("confirmed")}
-    for oid,obj in conf_w.items():
-        best_pid=None; best_s=-1e9; sec_s=-1e9
-        for pid,p in conf_p.items():
-            s=weapon_match_score(obj["bbox"],p["bbox"])
-            if s>best_s: sec_s=best_s; best_s=s; best_pid=pid
-            elif s>sec_s: sec_s=s
-        if best_pid is None: continue
-        margin=best_s-sec_s
-        if best_s<1.2 or margin<0.35: continue
-        if conf_p[best_pid].get("identity")=="owner" and margin<0.60: continue
-        out[best_pid].append({
-            "class_name":obj["class_name"],"conf":obj["conf"],
-            "bbox":obj["bbox"],"object_id":oid,
+def face_box_to_person_box(face_box, frame_shape):
+    """Expand an MTCNN face box (x1,y1,x2,y2) to an estimated full-body box."""
+    fx1, fy1, fx2, fy2 = face_box
+    H, W = frame_shape[:2]
+    fw = fx2 - fx1
+    fh = fy2 - fy1
+
+    x1 = max(0, int(fx1 - 0.6 * fw))
+    y1 = max(0, int(fy1 - 0.4 * fh))
+    x2 = min(W - 1, int(fx2 + 0.6 * fw))
+    y2 = min(H - 1, int(fy2 + 3.5 * fh))
+
+    return [x1, y1, x2, y2]
+
+
+def maybe_switch_object_class(object_id, candidate_class, candidate_conf):
+    obj = active_objects[object_id]
+    current_class = obj["class_name"]
+
+    if current_class == candidate_class:
+        switch_candidate_history[object_id].clear()
+        return
+
+    current_priority = CLASS_PRIORITY.get(current_class, 0)
+    candidate_priority = CLASS_PRIORITY.get(candidate_class, 0)
+
+    if candidate_priority <= current_priority:
+        switch_candidate_history[object_id].clear()
+        return
+
+    if candidate_conf < ENTRY_THRESHOLDS.get(candidate_class, 0.50):
+        switch_candidate_history[object_id].clear()
+        return
+
+    switch_candidate_history[object_id].append(candidate_class)
+
+    recent = list(switch_candidate_history[object_id])[-CLASS_SWITCH_CONFIRM_FRAMES:]
+    if len(recent) == CLASS_SWITCH_CONFIRM_FRAMES and all(c == candidate_class for c in recent):
+        obj["class_name"] = candidate_class
+        switch_candidate_history[object_id].clear()
+
+
+
+def detect_faces_full_frame(frame_bgr):
+    # Use MTCNN (via owner_recognizer) for accurate detection + alignment.
+    # Returns face_tensor (pre-aligned, ready for FaceNet) instead of raw crop.
+    return owner_recognizer.detect_faces(frame_bgr)
+
+
+def match_faces_to_persons(detected_faces, persons):
+    assignments = {}
+    used_pids = set()
+
+    for face in detected_faces:
+        fc = face["center"]
+
+        best_pid = None
+        best_score = -1e9
+
+        for pid, pdata in persons.items():
+            if not pdata.get("confirmed", False):
+                continue
+            if pid in used_pids:
+                continue
+
+            pbox = pdata["bbox"]
+            px1, py1, px2, py2 = pbox
+            pc = bbox_center(pbox)
+            person_h = max(1.0, bbox_height(pbox))
+
+            d = distance(fc, pc)
+            norm_d = d / person_h
+
+            score = 0.0
+
+            if point_in_box(fc, pbox):
+                score += 3.0
+
+            score += max(0.0, 2.0 - norm_d)
+
+            fx1, fy1, fx2, fy2 = face["face_box"]
+            face_box = [fx1, fy1, fx2, fy2]
+            score += 2.0 * iou(face_box, pbox)
+
+            upper_half_box = [px1, py1, px2, py1 + int(0.55 * (py2 - py1))]
+            if point_in_box(fc, upper_half_box):
+                score += 1.0
+
+            if score > best_score:
+                best_score = score
+                best_pid = pid
+
+        if best_pid is not None and best_score > 1.0:
+            assignments[best_pid] = face
+            used_pids.add(best_pid)
+
+    return assignments
+
+
+def run_owner_recognition(frame):
+    global recognized_owner_id
+
+    if not OWNER_RECOGNITION_ENABLED:
+        recognized_owner_id = None
+        return
+
+    if recognized_owner_id is not None and recognized_owner_id in active_persons:
+        return
+
+    for pid, pdata in active_persons.items():
+        pdata["face_box_global"] = None
+        pdata["owner_distance"] = 999.0
+        pdata["owner_label"] = "UNKNOWN"
+
+    detected_faces = detect_faces_full_frame(frame)
+    face_assignments = match_faces_to_persons(detected_faces, active_persons)
+
+    best_pid = None
+    best_dist = 999.0
+
+    for pid, pdata in active_persons.items():
+        if not pdata["confirmed"]:
+            continue
+
+        face_info = face_assignments.get(pid, None)
+
+        if face_info is None:
+            pdata["owner_match_streak"] = 0
+            continue
+
+        pdata["face_box_global"] = face_info["face_box"]
+
+        # recognize_tensor uses the pre-aligned MTCNN tensor — much more accurate
+        result = owner_recognizer.recognize_tensor(face_info["face_tensor"])
+
+        dist = float(result.get("distance", 999.0))
+        is_owner = dist < OWNER_DISTANCE_THRESHOLD
+
+        pdata["owner_distance"] = dist
+        pdata["owner_label"] = "OWNER" if is_owner else "UNKNOWN"
+
+        if is_owner:
+            pdata["owner_match_streak"] = pdata.get("owner_match_streak", 0) + 1
+        else:
+            pdata["owner_match_streak"] = 0
+
+        if pdata["owner_match_streak"] >= OWNER_CONFIRM_FRAMES and dist < best_dist:
+            best_dist = dist
+            best_pid = pid
+
+    if best_pid is not None:
+        recognized_owner_id = best_pid
+        for pid in active_persons:
+            active_persons[pid]["owner_confirmed"] = (pid == recognized_owner_id)
+            active_persons[pid]["identity"] = "owner" if pid == recognized_owner_id else "unknown"
+
+
+def make_hand_zone(person_box):
+    x1, y1, x2, y2 = person_box
+    w = bbox_width(person_box)
+    h = bbox_height(person_box)
+
+    hx1 = int(x1 - 0.25 * w)
+    hy1 = int(y1 + 0.18 * h)
+    hx2 = int(x2 + 0.25 * w)
+    hy2 = int(y1 + 0.78 * h)
+
+    return [hx1, hy1, hx2, hy2]
+
+
+def weapon_person_match_score(weapon_box, person_box):
+    wc = bbox_center(weapon_box)
+    pc = bbox_center(person_box)
+
+    dist = distance(wc, pc)
+    person_h = max(1, bbox_height(person_box))
+    norm_dist = dist / person_h
+
+    overlap = iou(weapon_box, person_box)
+    hand_zone = make_hand_zone(person_box)
+
+    in_hand_zone = point_in_box(wc, hand_zone)
+    inside_person = point_in_box(wc, person_box)
+
+    score = 0.0
+    score += max(0.0, 2.0 - norm_dist)
+    score += 3.0 * overlap
+
+    if inside_person:
+        score += 1.5
+    if in_hand_zone:
+        score += 2.0
+
+    return score
+
+
+def assign_weapons_to_people(active_persons, active_objects):
+    assignments = {pid: [] for pid in active_persons.keys()}
+
+    confirmed_people = {
+        pid: pdata for pid, pdata in active_persons.items()
+        if pdata.get("confirmed", False)
+    }
+
+    confirmed_weapons = {
+        oid: obj for oid, obj in active_objects.items()
+        if obj.get("confirmed", False) and obj.get("class_name") in WEAPON_CLASSES
+    }
+
+    for oid, obj in confirmed_weapons.items():
+        weapon_box = obj["bbox"]
+
+        best_pid = None
+        best_score = -1e9
+        second_best_score = -1e9
+
+        for pid, pdata in confirmed_people.items():
+            person_box = pdata["bbox"]
+            score = weapon_person_match_score(weapon_box, person_box)
+
+            if score > best_score:
+                second_best_score = best_score
+                best_score = score
+                best_pid = pid
+            elif score > second_best_score:
+                second_best_score = score
+
+        if best_pid is None:
+            continue
+
+        margin = best_score - second_best_score
+
+        if best_score < 1.2 or margin < 0.35:
+            continue
+
+        if confirmed_people[best_pid].get("identity", "unknown") == "owner" and margin < 0.60:
+            continue
+
+        assignments[best_pid].append({
+            "class_name": obj["class_name"],
+            "conf": obj["conf"],
+            "bbox": obj["bbox"],
+            "object_id": oid,
+            "match_score": best_score,
+            "match_margin": margin,
         })
-    return out
+
+    return assignments
 
 
-# =============================================================================
-# OWNER RECOGNITION — INSIDE YOLO BOX ONLY
-# =============================================================================
-def recognize_in_yolo_box(frame, person_box):
-    """
-    Crop the top OWNER_FACE_REGION_FRAC of the YOLO box, run MTCNN inside it,
-    embed with FaceNet.  Returns dict or None.
-    """
-    H, W = frame.shape[:2]
-    x1,y1,x2,y2 = [int(v) for v in person_box]
-    fy2 = y1 + int(OWNER_FACE_REGION_FRAC*(y2-y1))
-    rx1=max(0,x1); ry1=max(0,y1)
-    rx2=min(W-1,x2); ry2=min(H-1,fy2)
-    if rx2-rx1 < MIN_OWNER_FACE_SIZE or ry2<=ry1: return None
+def update_person_track(person_id, box, conf, source):
+    if person_id not in active_persons:
+        return
 
-    crop = frame[ry1:ry2, rx1:rx2]
-    if crop.size == 0: return None
+    old_conf = active_persons[person_id]["conf"]
+    smoothed_conf = 0.8 * old_conf + 0.2 * conf
 
-    faces = owner_recognizer.detect_faces(crop)
-    if not faces: return None
+    old_box = active_persons[person_id]["bbox"]
+    smoothed_box = [
+        int(0.7 * old_box[0] + 0.3 * box[0]),
+        int(0.7 * old_box[1] + 0.3 * box[1]),
+        int(0.7 * old_box[2] + 0.3 * box[2]),
+        int(0.7 * old_box[3] + 0.3 * box[3]),
+    ]
 
-    best = max(faces, key=lambda f: f["prob"])
-    result = owner_recognizer.recognize_tensor(best["face_tensor"])
-    dist   = float(result.get("distance", 999.0))
-
-    fx1,fy1c,fx2,fy2c = best["face_box"]
-    gfb = (rx1+fx1, ry1+fy1c, rx1+fx2, ry1+fy2c)
-    return {"distance": dist, "face_box": gfb, "prob": best["prob"]}
+    active_persons[person_id]["bbox"] = smoothed_box
+    active_persons[person_id]["conf"] = smoothed_conf
+    active_persons[person_id]["missing"] = 0
+    active_persons[person_id]["seen_count"] += 1
+    active_persons[person_id]["confirmed"] = True
+    active_persons[person_id]["source"] = source
 
 
-# =============================================================================
+# -----------------------------
 # MAIN LOOP
-# =============================================================================
+# -----------------------------
 while True:
     frame = cam.read()
     if frame is None:
@@ -240,303 +555,430 @@ while True:
 
     frame_count += 1
 
-    # ── MOTION GATE ───────────────────────────────────────────────────────────
-    gray_s = cv2.resize(
-        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
-        (80, 60), interpolation=cv2.INTER_AREA
-    )
-    if prev_gray_small is not None:
-        diff          = cv2.absdiff(gray_s, prev_gray_small)
-        changed_ratio = float(np.count_nonzero(diff > MOTION_PIXEL_DIFF)) / diff.size
-    else:
-        changed_ratio = 1.0
-    prev_gray_small = gray_s
-
-    if changed_ratio < MOTION_THRESHOLD and not active_persons:
-        # Nothing moving AND no one being tracked — skip everything
-        cv2.putText(frame, "IDLE", (10,25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (120,120,120), 2)
-        cv2.imshow("Threat Detection", frame)
-        if cv2.waitKey(1) & 0xFF == 27: break
-        continue
-    # If persons are already tracked, always continue even if scene is still
-
-    # ── STEP 1 : YOLO — PERSON DETECTION ONLY ────────────────────────────────
     if frame_count % YOLO_EVERY == 0:
-        results    = model(frame)
+        results = model(frame)
         detections = results.xyxy[0].cpu().numpy()
 
-    current_person_dets = []
-    current_object_dets = []
+    current_person_detections = []
+    current_object_detections = []
 
+    # STEP 1: YOLO FILTERING
     for det in detections:
-        x1,y1,x2,y2,conf,cls = det
-        cls=int(cls); conf=float(conf)
-        cname = CLASS_NAMES.get(cls)
-        if cname is None: continue
-        box = [int(x1),int(y1),int(x2),int(y2)]
+        x1, y1, x2, y2, conf, cls = det
+        cls = int(cls)
+        conf = float(conf)
 
-        if cname == "person":
-            mid = match_to_tracks(box, active_persons,
-                                  iou_thr=0.20, dist_thr=300)
-            if mid is None:
-                if conf < ENTRY_THRESHOLDS["person"]: continue
+        class_name = class_id_to_name(cls)
+        if class_name is None:
+            continue
+
+        box = [int(x1), int(y1), int(x2), int(y2)]
+
+        if class_name == "person":
+            bw = box[2] - box[0]
+            bh = box[3] - box[1]
+
+            # Reject boxes that are too small or wider than they are tall
+            # (coats on hooks, chairs, etc. often fail the aspect ratio check)
+            if bh < PERSON_MIN_HEIGHT or bw < PERSON_MIN_WIDTH:
+                continue
+            if bw > 0 and (bh / bw) < PERSON_MIN_ASPECT:
+                continue
+
+            matched_id = match_detection_to_tracks(
+                box,
+                active_persons,
+                iou_threshold=0.20,
+                dist_threshold=300
+            )
+
+            if matched_id is None:
+                if not should_accept_new(class_name, conf):
+                    continue
             else:
-                if conf < KEEP_THRESHOLDS["person"]: continue
-            current_person_dets.append({"bbox":box,"conf":conf,"source":"yolo"})
+                if not should_keep_existing(class_name, conf):
+                    continue
 
-        else:   # weapons / objects — collected but processed only if non-owners present
-            mid = match_to_tracks(box, active_objects,
-                                  iou_thr=0.20, dist_thr=180)
-            if mid is None:
-                if conf < ENTRY_THRESHOLDS.get(cname,0.5): continue
-            else:
-                if conf < KEEP_THRESHOLDS.get(cname,0.35): continue
-            current_object_dets.append({"bbox":box,"conf":conf,"class_name":cname})
+            current_person_detections.append({
+                "bbox": box,
+                "conf": conf,
+                "class_name": class_name,
+                "source": "yolo"
+            })
 
-    # ── STEP 2 : UPDATE PERSON TRACKS ────────────────────────────────────────
-    matched_pids = set()
-    used_dets    = set()
-
-    # Protect locked owner first
-    if recognized_owner_id is not None and recognized_owner_id in active_persons:
-        ob = active_persons[recognized_owner_id]["bbox"]
-        bi=None; bv=-1.0; bd=float("inf")
-        for i,d in enumerate(current_person_dets):
-            ov=iou(d["bbox"],ob)
-            dv=dist2d(bbox_center(d["bbox"]),bbox_center(ob))
-            if ov>bv or (abs(ov-bv)<1e-6 and dv<bd):
-                bv=ov; bd=dv; bi=i
-        ok = bi is not None and (bv>=0.10 or bd<120)
-        if ok:
-            update_person_track(recognized_owner_id,
-                                current_person_dets[bi]["bbox"],
-                                current_person_dets[bi]["conf"],
-                                "yolo")
-            matched_pids.add(recognized_owner_id)
-            used_dets.add(bi)
         else:
-            p = active_persons[recognized_owner_id]
-            p["owner_confirmed"]=False; p["identity"]="unknown"
-            p["owner_match_streak"]=0;  p["owner_distance"]=999.0
-            p["face_box_global"]=None
-            recognized_owner_id = None
+            matched_id = match_detection_to_tracks(
+                box,
+                active_objects,
+                iou_threshold=0.20,
+                dist_threshold=180
+            )
 
-    # Match remaining detections
-    for i,d in enumerate(current_person_dets):
-        if i in used_dets: continue
-        skip = {recognized_owner_id} if recognized_owner_id else set()
-        pid  = match_to_tracks(d["bbox"], active_persons,
-                               iou_thr=0.20, dist_thr=300, skip=skip)
-        if pid is None:
-            pid = next_person_id; next_person_id += 1
-            active_persons[pid] = {
-                "bbox":d["bbox"], "conf":d["conf"], "missing":0,
-                "identity":"unknown", "seen_count":1, "confirmed":True,
-                "source":"yolo", "owner_confirmed":False,
-                "owner_distance":999.0, "face_box_global":None,
-                "owner_match_streak":0,
+            if matched_id is None:
+                if not should_accept_new(class_name, conf):
+                    continue
+            else:
+                if not should_keep_existing(class_name, conf):
+                    continue
+
+            current_object_detections.append({
+                "bbox": box,
+                "conf": conf,
+                "class_name": class_name
+            })
+
+    # STEP 2: FACE FALLBACK (MTCNN — same detector used for owner recognition)
+    if FACE_FALLBACK_ENABLED:
+        mtcnn_faces = owner_recognizer.detect_faces(frame)
+        for face in mtcnn_faces:
+            pseudo_person_box = face_box_to_person_box(face["face_box"], frame.shape)
+
+            already_covered = False
+            for det in current_person_detections:
+                if iou(pseudo_person_box, det["bbox"]) > 0.25:
+                    already_covered = True
+                    break
+
+            if already_covered:
+                continue
+
+            current_person_detections.append({
+                "bbox": pseudo_person_box,
+                "conf": 0.99,
+                "class_name": "person",
+                "source": "face_fallback"
+            })
+
+    # STEP 3: UPDATE PERSONS
+    matched_person_ids = set()
+    used_detection_idxs = set()
+
+    # 3A: protect locked owner track first
+    if recognized_owner_id is not None and recognized_owner_id in active_persons:
+        owner_box = active_persons[recognized_owner_id]["bbox"]
+
+        best_idx = None
+        best_iou = -1.0
+        best_dist = float("inf")
+        owner_match_ok = False
+
+        for i, det in enumerate(current_person_detections):
+            box = det["bbox"]
+            ov = iou(box, owner_box)
+            d = distance(bbox_center(box), bbox_center(owner_box))
+
+            if ov > best_iou:
+                best_iou = ov
+                best_dist = d
+                best_idx = i
+            elif abs(ov - best_iou) < 1e-6 and d < best_dist:
+                best_dist = d
+                best_idx = i
+
+        if best_idx is not None:
+            det = current_person_detections[best_idx]
+            box = det["bbox"]
+            conf = det["conf"]
+            source = det.get("source", "yolo")
+
+            owner_match_ok = (best_iou >= 0.10) or (best_dist < 120)
+
+            if owner_match_ok:
+                update_person_track(recognized_owner_id, box, conf, source)
+                matched_person_ids.add(recognized_owner_id)
+                used_detection_idxs.add(best_idx)
+
+        if not owner_match_ok:
+            active_persons[recognized_owner_id]["owner_confirmed"] = False
+            active_persons[recognized_owner_id]["identity"] = "unknown"
+            active_persons[recognized_owner_id]["owner_match_streak"] = 0
+            active_persons[recognized_owner_id]["owner_distance"] = 999.0
+            active_persons[recognized_owner_id]["owner_label"] = "UNKNOWN"
+            active_persons[recognized_owner_id]["face_box_global"] = None
+            recognized_owner_id = None
+            # track stays alive — normal PERSON_MISSING_FRAMES grace applies
+
+    # 3B: match remaining detections to remaining tracks
+    for i, det in enumerate(current_person_detections):
+        if i in used_detection_idxs:
+            continue
+
+        box = det["bbox"]
+        conf = det["conf"]
+        source = det.get("source", "yolo")
+
+        skip_ids = {recognized_owner_id} if recognized_owner_id is not None else set()
+
+        person_id = match_detection_to_tracks(
+            box,
+            active_persons,
+            iou_threshold=0.20,
+            dist_threshold=300,
+            skip_ids=skip_ids
+        )
+
+        if person_id is None:
+            person_id = next_person_id
+            next_person_id += 1
+
+            active_persons[person_id] = {
+                "bbox": box,
+                "conf": conf,
+                "missing": 0,
+                "identity": "unknown",
+                "seen_count": 1,
+                "confirmed": True,
+                "source": source,
+                "owner_confirmed": False,
+                "owner_distance": 999.0,
+                "owner_label": "UNKNOWN",
+                "face_box_global": None,
+                "owner_match_streak": 0,
             }
         else:
-            update_person_track(pid, d["bbox"], d["conf"], "yolo")
-        matched_pids.add(pid)
+            update_person_track(person_id, box, conf, source)
 
-    # Age out persons
-    for pid in list(active_persons):
-        if pid not in matched_pids:
+        matched_person_ids.add(person_id)
+
+    for pid in list(active_persons.keys()):
+        if pid not in matched_person_ids:
             active_persons[pid]["missing"] += 1
+
             if active_persons[pid]["missing"] > PERSON_MISSING_FRAMES:
                 del active_persons[pid]
                 if recognized_owner_id == pid:
                     recognized_owner_id = None
 
-    if recognized_owner_id not in active_persons:
+    if recognized_owner_id is not None and recognized_owner_id not in active_persons:
         recognized_owner_id = None
 
-    # ── STEP 3 : IF NO PERSONS — do nothing else ──────────────────────────────
-    if not active_persons:
-        cv2.putText(frame, "No person", (10,25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (120,120,120), 2)
-        cv2.imshow("Threat Detection", frame)
-        if cv2.waitKey(1) & 0xFF == 27: break
-        continue
+    # STEP 4: OWNER RECOGNITION
+    if (
+        OWNER_RECOGNITION_ENABLED
+        and recognized_owner_id is None
+        and frame_count % OWNER_RECOGNITION_EVERY == 0
+    ):
+        run_owner_recognition(frame)
 
-    # ── STEP 4 : FACE RECOGNITION ON EACH PERSON ─────────────────────────────
-    # Run every OWNER_RECOGNITION_EVERY frames when owner not yet locked
-    if recognized_owner_id is None and frame_count % OWNER_RECOGNITION_EVERY == 0:
-        best_pid=None; best_dist=999.0
-        for pid, pdata in active_persons.items():
-            if not pdata["confirmed"]: continue
-            result = recognize_in_yolo_box(frame, pdata["bbox"])
-            pdata["face_box_global"] = None
-            if result is None:
-                pdata["owner_distance"]     = 999.0
-                pdata["owner_match_streak"] = 0
-                continue
-            dist = result["distance"]
-            pdata["owner_distance"]   = dist
-            pdata["face_box_global"]  = result["face_box"]
-            if dist < OWNER_DISTANCE_THRESHOLD:
-                pdata["owner_match_streak"] = pdata.get("owner_match_streak",0) + 1
-            else:
-                pdata["owner_match_streak"] = 0
-            if pdata["owner_match_streak"] >= OWNER_CONFIRM_FRAMES and dist < best_dist:
-                best_dist = dist; best_pid = pid
-        if best_pid is not None:
-            recognized_owner_id = best_pid
-
-    # Sync identity
     for pid in active_persons:
-        is_owner = (pid == recognized_owner_id)
-        active_persons[pid]["identity"]        = "owner" if is_owner else "unknown"
-        active_persons[pid]["owner_confirmed"] = is_owner
+        if pid == recognized_owner_id:
+            active_persons[pid]["identity"] = "owner"
+            active_persons[pid]["owner_confirmed"] = True
+        else:
+            active_persons[pid]["identity"] = "unknown"
+            active_persons[pid]["owner_confirmed"] = False
 
-    # ── STEP 5 : DECIDE WHAT TO RUN PER PERSON ───────────────────────────────
-    #  • OWNER  → draw OWNER box + distance, skip ALL analysis
-    #  • OTHERS → run weapons, aggression, behavior, threat scoring
+    effective_owner_id = recognized_owner_id if recognized_owner_id in active_persons else None
 
-    non_owner_pids = [pid for pid in active_persons
-                      if active_persons[pid]["confirmed"]
-                      and pid != recognized_owner_id]
+    # STEP 5: UPDATE OBJECTS
+    matched_object_ids = set()
 
-    # Only update objects / run threat analysis when there are non-owners
-    weapon_assignments = {pid: [] for pid in active_persons}
-    threat_results     = {}
+    for det in current_object_detections:
+        box = det["bbox"]
+        conf = det["conf"]
+        candidate_class = det["class_name"]
 
-    if non_owner_pids:
-        # Update object tracks
-        matched_oids = set()
-        for d in current_object_dets:
-            box=d["bbox"]; conf=d["conf"]; cname=d["class_name"]
-            oid=match_to_tracks(box,active_objects,iou_thr=0.20,dist_thr=180)
-            if oid is None:
-                oid=next_object_id; next_object_id+=1
-                active_objects[oid]={
-                    "bbox":box,"conf":conf,"class_name":cname,
-                    "missing":0,"seen_count":1,"confirmed":False,
-                }
-                object_class_history[oid]=deque(maxlen=5)
-                object_class_history[oid].append(cname)
-            else:
-                ob=active_objects[oid]["bbox"]
-                active_objects[oid]["bbox"]=[int(0.7*ob[i]+0.3*box[i]) for i in range(4)]
-                active_objects[oid]["conf"]=0.7*active_objects[oid]["conf"]+0.3*conf
-                active_objects[oid]["missing"]=0
-                active_objects[oid]["seen_count"]+=1
-                maybe_switch_class(oid,cname,conf)
-            if active_objects[oid]["seen_count"] >= CLASS_CONFIRM_FRAMES.get(cname,1):
-                active_objects[oid]["confirmed"]=True
-            matched_oids.add(oid)
+        object_id = match_detection_to_tracks(
+            box,
+            active_objects,
+            iou_threshold=0.20,
+            dist_threshold=180
+        )
 
-        for oid in list(active_objects):
-            if oid not in matched_oids:
-                active_objects[oid]["missing"]+=1
-                switch_candidate_history[oid].clear()
-                if active_objects[oid]["missing"] > OBJECT_MISSING_FRAMES:
-                    del active_objects[oid]
-                    object_class_history.pop(oid,None)
-                    switch_candidate_history.pop(oid,None)
+        if object_id is None:
+            object_id = next_object_id
+            next_object_id += 1
 
-        threat_analyzer.cleanup_missing_tracks(active_persons.keys())
-        weapon_assignments = assign_weapons(active_persons, active_objects)
+            active_objects[object_id] = {
+                "bbox": box,
+                "conf": conf,
+                "class_name": candidate_class,
+                "missing": 0,
+                "seen_count": 1,
+                "confirmed": False
+            }
 
-        owner_bbox = (active_persons[recognized_owner_id]["bbox"]
-                      if recognized_owner_id in active_persons else None)
-
-        for pid in non_owner_pids:
-            pdata = active_persons[pid]
-            person  = {"id":pid,"bbox":pdata["bbox"],
-                       "identity":"unknown",
-                       "weapons":weapon_assignments.get(pid,[])}
-            context = {"mode":"indoor",
-                       "owner_present": recognized_owner_id in active_persons,
-                       "time_of_day":"day",
-                       "owner_bbox":owner_bbox,
-                       "owner_id":recognized_owner_id}
-            level, score, _, debug = threat_analyzer.analyze_person(
-                frame, person, context, frame_index=frame_count)
-            threat_results[pid] = (level, score, debug)
-
-    else:
-        # Only owner(s) in frame — clear stale object tracks gradually
-        for oid in list(active_objects):
-            active_objects[oid]["missing"] += 1
-            if active_objects[oid]["missing"] > OBJECT_MISSING_FRAMES:
-                del active_objects[oid]
-                object_class_history.pop(oid,None)
-                switch_candidate_history.pop(oid,None)
-
-    # ── DRAW ─────────────────────────────────────────────────────────────────
-    for pid, pdata in active_persons.items():
-        if not pdata["confirmed"]: continue
-        x1,y1,x2,y2 = pdata["bbox"]
-        is_owner = (pid == recognized_owner_id)
-
-        if is_owner:
-            # OWNER — yellow box, minimal info
-            cv2.rectangle(frame,(x1,y1),(x2,y2),(255,255,0),3)
-            cv2.putText(frame,"OWNER",(x1,max(20,y1-10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,0),2)
-            dist_v = pdata.get("owner_distance",999.0)
-            cv2.putText(frame,f"dist:{dist_v:.3f}",(x1,max(40,y1+16)),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,0),1)
-            fb = pdata.get("face_box_global")
-            if fb:
-                cv2.rectangle(frame,(fb[0],fb[1]),(fb[2],fb[3]),(200,200,0),1)
+            object_class_history[object_id] = deque(maxlen=5)
+            object_class_history[object_id].append(candidate_class)
 
         else:
-            level, score, debug = threat_results.get(pid, ("SAFE", 0.0, {}))
-            color = ((0,0,255) if level=="THREAT" else
-                     (0,255,255) if level=="SUSPICIOUS" else (0,255,0))
-            cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
-            cv2.putText(frame,f"ID {pid} | {level} {score:.1f}",
-                        (x1,max(20,y1-10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.65,color,2)
+            old_conf = active_objects[object_id]["conf"]
+            smoothed_conf = 0.7 * old_conf + 0.3 * conf
 
-            info = [
-                f"threat_score: {score:.1f}",
-                f"ID_score:     {debug.get('identity_score',0):.1f}",
-                f"weapon_score: {debug.get('weapon_score',0):.1f}",
-                f"aggr_score:   {debug.get('aggression_score',0):.2f}",
-                f"aggr_pts:     {debug.get('aggression_points',0):.1f}",
-                f"behavior:     {debug.get('behavior_score',0):.1f}",
-                f"owner_prox:   {debug.get('owner_proximity_score',0):.1f}",
-                f"robot_dist:   {debug.get('robot_distance_score',0):.1f}",
-                f"person_conf:  {pdata['conf']:.2f}",
-                f"owner_dist:   {pdata.get('owner_distance',999):.3f}"
-                f" | streak:{pdata.get('owner_match_streak',0)}",
+            old_box = active_objects[object_id]["bbox"]
+            smoothed_box = [
+                int(0.7 * old_box[0] + 0.3 * box[0]),
+                int(0.7 * old_box[1] + 0.3 * box[1]),
+                int(0.7 * old_box[2] + 0.3 * box[2]),
+                int(0.7 * old_box[3] + 0.3 * box[3]),
             ]
-            wlist = weapon_assignments.get(pid, [])
-            if wlist:
-                info.append("weapons: " + ", ".join(
-                    f"{w['class_name']}({w['conf']:.2f})" for w in wlist[:3]))
-            else:
-                info.append("weapons: none")
-            draw_text_block(frame, info, x1, min(frame.shape[0]-130, y2+20), color)
 
-            fb = pdata.get("face_box_global")
-            if fb:
-                cv2.rectangle(frame,(fb[0],fb[1]),(fb[2],fb[3]),(200,200,0),1)
+            active_objects[object_id]["bbox"] = smoothed_box
+            active_objects[object_id]["conf"] = smoothed_conf
+            active_objects[object_id]["missing"] = 0
+            active_objects[object_id]["seen_count"] += 1
 
-    # Draw confirmed weapons
-    for obj in active_objects.values():
-        if not obj["confirmed"]: continue
-        ox1,oy1,ox2,oy2 = obj["bbox"]
-        cv2.rectangle(frame,(ox1,oy1),(ox2,oy2),(255,0,0),2)
-        cv2.putText(frame,f"{obj['class_name']} {obj['conf']:.2f}",
-                    (ox1,max(20,oy1-8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0),2)
+            maybe_switch_object_class(object_id, candidate_class, conf)
 
-    # HUD
-    owner_txt = (f"OWNER ID {recognized_owner_id}"
-                 if recognized_owner_id in active_persons else "OWNER: searching")
-    cv2.putText(frame, owner_txt, (10,25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
-    cv2.putText(frame, f"motion:{changed_ratio*100:.1f}%", (10,48),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1)
+        needed = confirm_needed(active_objects[object_id]["class_name"])
+        if active_objects[object_id]["seen_count"] >= needed:
+            active_objects[object_id]["confirmed"] = True
 
-    cv2.imshow("Threat Detection", frame)
-    if cv2.waitKey(1) & 0xFF == 27:
+        matched_object_ids.add(object_id)
+
+    for oid in list(active_objects.keys()):
+        if oid not in matched_object_ids:
+            active_objects[oid]["missing"] += 1
+
+            if oid in switch_candidate_history:
+                switch_candidate_history[oid].clear()
+
+            if active_objects[oid]["missing"] > OBJECT_MISSING_FRAMES:
+                del active_objects[oid]
+                if oid in object_class_history:
+                    del object_class_history[oid]
+                if oid in switch_candidate_history:
+                    del switch_candidate_history[oid]
+
+    threat_analyzer.cleanup_missing_tracks(active_persons.keys())
+
+    # STEP 6: GLOBAL WEAPON OWNERSHIP
+    weapon_assignments = assign_weapons_to_people(active_persons, active_objects)
+
+    # STEP 7: ANALYZE ALL PERSONS
+    owner_bbox = active_persons[effective_owner_id]["bbox"] if effective_owner_id in active_persons else None
+
+    for pid, person_data in active_persons.items():
+        if not person_data["confirmed"]:
+            continue
+
+        pbox = person_data["bbox"]
+        assigned_weapons = weapon_assignments.get(pid, [])
+
+        is_real_owner = (pid == recognized_owner_id)
+        identity = "owner" if is_real_owner else "unknown"
+
+        person = {
+            "id": pid,
+            "bbox": pbox,
+            "identity": identity,
+            "weapons": assigned_weapons
+        }
+
+        context = {
+            "mode": "indoor",
+            "owner_present": effective_owner_id in active_persons,
+            "time_of_day": "day",
+            "owner_bbox": owner_bbox,
+            "owner_id": effective_owner_id,
+        }
+
+        threat_level, threat_score, explanation, debug = threat_analyzer.analyze_person(
+            frame,
+            person,
+            context,
+            frame_index=frame_count,
+        )
+
+        x1, y1, x2, y2 = pbox
+
+        if is_real_owner:
+            color = (255, 255, 0)
+        else:
+            color = (0, 255, 0)
+            if threat_level == "SUSPICIOUS":
+                color = (0, 255, 255)
+            elif threat_level == "THREAT":
+                color = (0, 0, 255)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if is_real_owner else 2)
+
+        if is_real_owner:
+            main_label = "OWNER"
+        else:
+            main_label = f"ID {pid} | {threat_level} {threat_score:.1f}"
+
+        cv2.putText(
+            frame,
+            main_label,
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2
+        )
+
+        info_lines = []
+
+        if not is_real_owner:
+            info_lines.append(f"threat_score: {threat_score:.1f}")
+            info_lines.append(f"ID_score: {debug.get('identity_score', 0.0):.1f}")
+            info_lines.append(f"weapon_score: {debug.get('weapon_score', 0.0):.1f}")
+            info_lines.append(f"aggr_score: {debug.get('aggression_score', 0.0):.2f}")
+            info_lines.append(f"aggr_pts: {debug.get('aggression_points', 0.0):.1f}")
+            info_lines.append(f"behavior: {debug.get('behavior_score', 0.0):.1f}")
+            info_lines.append(f"owner_prox: {debug.get('owner_proximity_score', 0.0):.1f}")
+            info_lines.append(f"robot_dist: {debug.get('robot_distance_score', 0.0):.1f}")
+
+        info_lines.append(f"person_conf: {person_data['conf']:.2f}")
+        info_lines.append(f"source: {person_data.get('source', 'yolo')}")
+
+        owner_dist = person_data.get("owner_distance", 999.0)
+        streak = person_data.get("owner_match_streak", 0)
+        info_lines.append(f"owner_dist: {owner_dist:.3f} | streak: {streak}")
+
+        if assigned_weapons:
+            weapon_text = ", ".join(
+                [f"{w['class_name']}({w['conf']:.2f})" for w in assigned_weapons[:3]]
+            )
+            info_lines.append(f"weapons: {weapon_text}")
+        else:
+            info_lines.append("weapons: none")
+
+        draw_text_block(frame, info_lines, x1, min(frame.shape[0] - 110, y2 + 20), color)
+
+        face_box = person_data.get("face_box_global", None)
+        if face_box is not None:
+            fx1, fy1, fx2, fy2 = face_box
+            cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (200, 200, 0), 1)
+
+    # STEP 8: DRAW OBJECTS
+    for oid, obj in active_objects.items():
+        if not obj["confirmed"]:
+            continue
+
+        x1, y1, x2, y2 = obj["bbox"]
+        label = f"{obj['class_name']} {obj['conf']:.2f}"
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            2
+        )
+
+    summary_owner = "NONE"
+    if recognized_owner_id in active_persons:
+        summary_owner = f"OWNER ID {recognized_owner_id}"
+
+    cv2.putText(
+        frame,
+        f"Owner: {summary_owner}",
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.imshow("Threat Detection Test", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:
         break
 
 cam.stop()
