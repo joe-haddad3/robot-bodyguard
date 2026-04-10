@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import cv2
 import torch
 import math
@@ -13,7 +17,7 @@ from owner_recognizer_facenet import FaceNetOwnerRecognizer
 # PLATFORM MODE
 # Set RPI_MODE = True when running on Raspberry Pi 5
 # -----------------------------
-RPI_MODE = True
+RPI_MODE = False
 # -----------------------------
 # CAMERA / MODEL SETTINGS
 # -----------------------------
