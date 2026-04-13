@@ -1,16 +1,29 @@
+"""
+AggressionAnalyzer — face blendshapes + hand gesture analysis.
+
+Design notes:
+  - Pose/torso motion is intentionally REMOVED. BehaviorAnalyzer owns pose.
+    This avoids loading two pose models and running duplicate inference.
+  - This class is STATEFUL (keeps smoothing history). Create ONE instance
+    per tracked person — do NOT share across persons.
+  - Caller must pass real wall-clock milliseconds as timestamp_ms so that
+    MediaPipe VIDEO mode temporal tracking works correctly.
+    Use: int(time.time() * 1000)
+"""
+
 import cv2
 import math
 import os
 import urllib.request
 from collections import deque
 
-import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODEL_DIR = os.path.join(_BASE_DIR, "models", "aggression")
 
+# Only face + hand — pose removed (BehaviorAnalyzer handles it)
 _MODELS = {
     "face_landmarker.task": (
         "https://storage.googleapis.com/mediapipe-models/"
@@ -19,10 +32,6 @@ _MODELS = {
     "hand_landmarker.task": (
         "https://storage.googleapis.com/mediapipe-models/"
         "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-    ),
-    "pose_landmarker.task": (
-        "https://storage.googleapis.com/mediapipe-models/"
-        "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
     ),
 }
 
@@ -42,9 +51,7 @@ def clamp(x, lo=0.0, hi=1.0):
 
 
 def avg(values):
-    if not values:
-        return 0.0
-    return float(sum(values) / len(values))
+    return float(sum(values) / len(values)) if values else 0.0
 
 
 def euclidean(p1, p2):
@@ -52,17 +59,17 @@ def euclidean(p1, p2):
 
 
 class AggressionAnalyzer:
-    def __init__(
-        self,
-        face_model_path=None,
-        hand_model_path=None,
-        pose_model_path=None,
-        smooth_history=5
-    ):
+    """
+    Per-person aggression analyzer (face expression + hand gestures).
+
+    IMPORTANT: Create one instance per tracked person.
+    Sharing a single instance across persons corrupts the smoothing history.
+    """
+
+    def __init__(self, face_model_path=None, hand_model_path=None, smooth_history=6):
         _ensure_models()
         face_model_path = face_model_path or os.path.join(_MODEL_DIR, "face_landmarker.task")
         hand_model_path = hand_model_path or os.path.join(_MODEL_DIR, "hand_landmarker.task")
-        pose_model_path = pose_model_path or os.path.join(_MODEL_DIR, "pose_landmarker.task")
 
         BaseOptions = mp.tasks.BaseOptions
         VisionRunningMode = vision.RunningMode
@@ -72,9 +79,9 @@ class AggressionAnalyzer:
                 base_options=BaseOptions(model_asset_path=face_model_path),
                 running_mode=VisionRunningMode.VIDEO,
                 num_faces=1,
-                min_face_detection_confidence=0.5,
-                min_face_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_face_detection_confidence=0.4,
+                min_face_presence_confidence=0.4,
+                min_tracking_confidence=0.4,
                 output_face_blendshapes=True,
             )
         )
@@ -84,44 +91,23 @@ class AggressionAnalyzer:
                 base_options=BaseOptions(model_asset_path=hand_model_path),
                 running_mode=VisionRunningMode.VIDEO,
                 num_hands=2,
-                min_hand_detection_confidence=0.5,
-                min_hand_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_hand_detection_confidence=0.4,
+                min_hand_presence_confidence=0.4,
+                min_tracking_confidence=0.4,
             )
         )
 
-        self.pose_landmarker = vision.PoseLandmarker.create_from_options(
-            vision.PoseLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=pose_model_path),
-                running_mode=VisionRunningMode.VIDEO,
-                num_poses=1,
-                min_pose_detection_confidence=0.5,
-                min_pose_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
-                output_segmentation_masks=False,
-            )
-        )
-
+        # Per-instance history — never shared
         self.face_hist = deque(maxlen=smooth_history)
         self.hand_hist = deque(maxlen=smooth_history)
-        self.pose_hist = deque(maxlen=smooth_history)
-        self.motion_hist = deque(maxlen=smooth_history)
         self.final_hist = deque(maxlen=smooth_history)
-
         self.left_hand_center_hist = deque(maxlen=smooth_history)
         self.right_hand_center_hist = deque(maxlen=smooth_history)
-
-        self.prev_torso_center = None
         self.prev_timestamp_ms = None
 
-    def reset(self):
-        """Clear all history — call before reassigning this analyzer to a new track."""
-        for hist in (self.face_hist, self.hand_hist, self.pose_hist,
-                     self.motion_hist, self.final_hist,
-                     self.left_hand_center_hist, self.right_hand_center_hist):
-            hist.clear()
-        self.prev_torso_center = None
-        self.prev_timestamp_ms = None
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _smooth(self, hist, value):
         hist.append(float(value))
@@ -137,22 +123,38 @@ class AggressionAnalyzer:
             return 0.0
         return euclidean(hist[-1], hist[-2]) / dt_sec
 
-    def analyze(self, person_bgr, timestamp_ms):
-        if person_bgr is None or person_bgr.size == 0:
-            return {
-                "face_score": 0.0,
-                "hand_score": 0.0,
-                "pose_score": 0.0,
-                "motion_score": 0.0,
-                "aggression_score": 0.0,
-                "state": "CALM",
-                "debug": {}
-            }
+    # ------------------------------------------------------------------
+    # Main analysis
+    # ------------------------------------------------------------------
 
+    def analyze(self, person_bgr, timestamp_ms):
+        """
+        Analyze a person crop for aggression signals.
+
+        Args:
+            person_bgr  : BGR crop of the person bounding box.
+            timestamp_ms: int(time.time() * 1000) — real wall-clock ms.
+                          NEVER pass a counter; MediaPipe needs real time.
+
+        Returns:
+            dict with keys: face_score, hand_score, aggression_score, state, debug
+        """
+        _empty = {
+            "face_score": 0.0,
+            "hand_score": 0.0,
+            "aggression_score": 0.0,
+            "state": "CALM",
+            "debug": {},
+        }
+
+        if person_bgr is None or person_bgr.size == 0:
+            return _empty
+
+        # Compute real elapsed time for speed calculations
         if self.prev_timestamp_ms is None:
-            dt_sec = 1.0 / 30.0
+            dt_sec = 1.0 / 15.0   # assume ~15 fps for the very first frame
         else:
-            dt_sec = max(1e-6, (timestamp_ms - self.prev_timestamp_ms) / 1000.0)
+            dt_sec = max(1e-4, (timestamp_ms - self.prev_timestamp_ms) / 1000.0)
         self.prev_timestamp_ms = timestamp_ms
 
         rgb = cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB)
@@ -160,100 +162,66 @@ class AggressionAnalyzer:
 
         face_result = self.face_landmarker.detect_for_video(mp_image, timestamp_ms)
         hand_result = self.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-        pose_result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        face_score_raw = 0.0
-        hand_score_raw = 0.0
-        pose_score_raw = 0.0
-        motion_score_raw = 0.0
-
-        brow_down = 0.0
-        eye_squint = 0.0
-        smile = 0.0
-        lip_press = 0.0
-        nose_sneer = 0.0
+        # ---- FACE blendshapes ----
+        brow_down = eye_squint = smile = lip_press = nose_sneer = 0.0
         angry_face_score = 0.0
+        face_score_raw = 0.0
 
-        fist_count = 0
-        has_fist = 0.0
-        left_hand_speed_norm = 0.0
-        right_hand_speed_norm = 0.0
-        hand_movement_score = 0.0
-
-        forward_lean = 0.0
-        torso_center = None
-
-        fist_angry_bonus_raw = 0.0
-        fist_motion_bonus_raw = 0.0
-        angry_motion_bonus_raw = 0.0
-
-        WATCH_THRESHOLD = 0.20
-        AGGRESSIVE_THRESHOLD = 0.50
-
-        # ---- FACE ----
         if face_result.face_blendshapes:
-            shapes = {x.category_name: float(x.score) for x in face_result.face_blendshapes[0]}
+            shapes = {
+                x.category_name: float(x.score)
+                for x in face_result.face_blendshapes[0]
+            }
 
-            brow_down = 0.5 * (
-                shapes.get("browDownLeft", 0.0) +
-                shapes.get("browDownRight", 0.0)
-            )
-            eye_squint = 0.5 * (
-                shapes.get("eyeSquintLeft", 0.0) +
-                shapes.get("eyeSquintRight", 0.0)
-            )
-            smile = 0.5 * (
-                shapes.get("mouthSmileLeft", 0.0) +
-                shapes.get("mouthSmileRight", 0.0)
-            )
-            lip_press = 0.5 * (
-                shapes.get("mouthPressLeft", 0.0) +
-                shapes.get("mouthPressRight", 0.0)
-            )
-            nose_sneer = 0.5 * (
-                shapes.get("noseSneerLeft", 0.0) +
-                shapes.get("noseSneerRight", 0.0)
-            )
+            brow_down  = 0.5 * (shapes.get("browDownLeft",    0.0) + shapes.get("browDownRight",   0.0))
+            eye_squint = 0.5 * (shapes.get("eyeSquintLeft",   0.0) + shapes.get("eyeSquintRight",  0.0))
+            smile      = 0.5 * (shapes.get("mouthSmileLeft",  0.0) + shapes.get("mouthSmileRight", 0.0))
+            lip_press  = 0.5 * (shapes.get("mouthPressLeft",  0.0) + shapes.get("mouthPressRight", 0.0))
+            nose_sneer = 0.5 * (shapes.get("noseSneerLeft",   0.0) + shapes.get("noseSneerRight",  0.0))
 
+            # Smile reduces anger score — genuine smiles cancel aggression signals
             angry_face_score = clamp(
-                0.28 * brow_down +
+                0.30 * brow_down  +
                 0.18 * eye_squint +
-                0.24 * lip_press +
-                0.12 * nose_sneer -
+                0.26 * lip_press  +
+                0.14 * nose_sneer -
                 0.18 * smile
             )
-
             face_score_raw = angry_face_score
 
         # ---- HANDS ----
+        fist_count = 0
+        has_fist = 0.0
+        left_hand_speed_norm = right_hand_speed_norm = hand_movement_score = 0.0
+        hand_score_raw = 0.0
+
         if hand_result.hand_landmarks:
             h, w = person_bgr.shape[:2]
 
             for i, hand_landmarks in enumerate(hand_result.hand_landmarks):
                 pts = [(lm.x * w, lm.y * h) for lm in hand_landmarks]
 
-                wrist = pts[0]
+                wrist      = pts[0]
                 middle_mcp = pts[9]
-                palm_size = euclidean(wrist, middle_mcp) + 1e-6
+                palm_size  = euclidean(wrist, middle_mcp) + 1e-6
                 palm_center = (
                     (wrist[0] + middle_mcp[0]) / 2.0,
-                    (wrist[1] + middle_mcp[1]) / 2.0
+                    (wrist[1] + middle_mcp[1]) / 2.0,
                 )
 
-                curled = 0
-                for idx in [8, 12, 16, 20]:
-                    d = euclidean(pts[idx], palm_center) / palm_size
-                    if d < 1.35:
-                        curled += 1
-
-                is_fist = curled >= 3
-                if is_fist:
+                # Fingertip indices: index=8, middle=12, ring=16, pinky=20
+                curled = sum(
+                    1 for idx in [8, 12, 16, 20]
+                    if euclidean(pts[idx], palm_center) / palm_size < 1.35
+                )
+                if curled >= 3:
                     fist_count += 1
 
                 hand_center = self._hand_center(pts)
 
                 handedness_label = "Unknown"
-                if i < len(hand_result.handedness) and len(hand_result.handedness[i]) > 0:
+                if i < len(hand_result.handedness) and hand_result.handedness[i]:
                     handedness_label = hand_result.handedness[i][0].category_name
 
                 if handedness_label == "Left":
@@ -261,6 +229,7 @@ class AggressionAnalyzer:
                 elif handedness_label == "Right":
                     self.right_hand_center_hist.append(hand_center)
                 else:
+                    # Unknown handedness — assign to whichever side has fewer entries
                     if len(self.left_hand_center_hist) <= len(self.right_hand_center_hist):
                         self.left_hand_center_hist.append(hand_center)
                     else:
@@ -268,90 +237,44 @@ class AggressionAnalyzer:
 
             has_fist = 1.0 if fist_count >= 1 else 0.0
 
-            left_hand_speed = self._compute_speed(self.left_hand_center_hist, dt_sec)
-            right_hand_speed = self._compute_speed(self.right_hand_center_hist, dt_sec)
+            left_speed  = self._compute_speed(self.left_hand_center_hist, dt_sec)
+            right_speed = self._compute_speed(self.right_hand_center_hist, dt_sec)
 
-            left_hand_speed_norm = clamp(left_hand_speed / 900.0)
-            right_hand_speed_norm = clamp(right_hand_speed / 900.0)
-            hand_movement_score = max(left_hand_speed_norm, right_hand_speed_norm)
+            # 600 px/s = fully aggressive hand movement at typical RPi resolution
+            left_hand_speed_norm  = clamp(left_speed  / 600.0)
+            right_hand_speed_norm = clamp(right_speed / 600.0)
+            hand_movement_score   = max(left_hand_speed_norm, right_hand_speed_norm)
 
-            # fist alone should be enough for WATCH, but not AGGRESSIVE
-            hand_score_raw = clamp(
-                0.50 * has_fist +
-                0.50 * hand_movement_score
-            )
+            hand_score_raw = clamp(0.50 * has_fist + 0.50 * hand_movement_score)
 
-        # ---- POSE + TORSO MOTION ----
-        if pose_result.pose_landmarks:
-            lm = pose_result.pose_landmarks[0]
-            h, w = person_bgr.shape[:2]
-
-            nose = (lm[0].x * w, lm[0].y * h)
-            l_sh = (lm[11].x * w, lm[11].y * h)
-            r_sh = (lm[12].x * w, lm[12].y * h)
-            l_hip = (lm[23].x * w, lm[23].y * h)
-            r_hip = (lm[24].x * w, lm[24].y * h)
-
-            shoulder_center = (
-                (l_sh[0] + r_sh[0]) / 2.0,
-                (l_sh[1] + r_sh[1]) / 2.0
-            )
-            hip_center = (
-                (l_hip[0] + r_hip[0]) / 2.0,
-                (l_hip[1] + r_hip[1]) / 2.0
-            )
-
-            shoulder_width = euclidean(l_sh, r_sh) + 1e-6
-            forward_lean = clamp(abs(nose[0] - hip_center[0]) / (0.9 * shoulder_width))
-            pose_score_raw = forward_lean
-
-            torso_center = (
-                (shoulder_center[0] + hip_center[0]) / 2.0,
-                (shoulder_center[1] + hip_center[1]) / 2.0
-            )
-
-            if self.prev_torso_center is not None:
-                torso_speed = euclidean(torso_center, self.prev_torso_center) / dt_sec
-                motion_score_raw = clamp(torso_speed / 800.0)
-
-            self.prev_torso_center = torso_center
-
+        # ---- TEMPORAL SMOOTHING ----
         face_score = self._smooth(self.face_hist, face_score_raw)
         hand_score = self._smooth(self.hand_hist, hand_score_raw)
-        pose_score = self._smooth(self.pose_hist, pose_score_raw)
-        motion_score = self._smooth(self.motion_hist, motion_score_raw)
 
-        # ---- COMBO BONUSES ----
-        # aggressive is intentionally stricter now
+        # ---- COMBINATION BONUSES ----
+        # Individual signals alone are weak; combinations are the real threat indicator.
+        fist_angry_bonus  = 0.0
+        fist_motion_bonus = 0.0
+        angry_motion_bonus = 0.0
 
-        # fist + angry face
         if has_fist and face_score >= 0.22:
-            fist_angry_bonus_raw = clamp(0.30 * face_score)
+            fist_angry_bonus = clamp(0.35 * face_score)         # angry fist
 
-        # fist + fast hand movement
-        if has_fist and hand_movement_score >= 0.28:
-            fist_motion_bonus_raw = clamp(0.38 * hand_movement_score)
+        if has_fist and hand_movement_score >= 0.25:
+            fist_motion_bonus = clamp(0.40 * hand_movement_score)  # fast fist swing
 
-        # angry face + fast hand movement
-        if face_score >= 0.24 and hand_movement_score >= 0.24:
-            angry_motion_bonus_raw = clamp(0.22 * min(face_score, hand_movement_score))
+        if face_score >= 0.22 and hand_movement_score >= 0.22:
+            angry_motion_bonus = clamp(0.25 * min(face_score, hand_movement_score))
 
-        # ---- FINAL SCORE ----
-        base_score_raw = clamp(
-            0.26 * face_score +
-            0.30 * hand_score +
-            0.14 * pose_score +
-            0.08 * motion_score
-        )
+        combo_score = clamp(fist_angry_bonus + fist_motion_bonus + angry_motion_bonus)
 
-        combo_score_raw = clamp(
-            fist_angry_bonus_raw +
-            fist_motion_bonus_raw +
-            angry_motion_bonus_raw
-        )
-
-        final_raw = clamp(base_score_raw + combo_score_raw)
+        # Face and hands weighted equally at base; combos push the score up
+        base_score  = clamp(0.42 * face_score + 0.58 * hand_score)
+        final_raw   = clamp(base_score + combo_score)
         aggression_score = self._smooth(self.final_hist, final_raw)
+
+        WATCH_THRESHOLD      = 0.20
+        AGGRESSIVE_THRESHOLD = 0.50
 
         if aggression_score >= AGGRESSIVE_THRESHOLD:
             state = "AGGRESSIVE"
@@ -363,34 +286,24 @@ class AggressionAnalyzer:
         return {
             "face_score": face_score,
             "hand_score": hand_score,
-            "pose_score": pose_score,
-            "motion_score": motion_score,
             "aggression_score": aggression_score,
             "state": state,
             "debug": {
-                "face_raw": face_score_raw,
-                "hand_raw": hand_score_raw,
-                "pose_raw": pose_score_raw,
-                "motion_raw": motion_score_raw,
-                "base_score_raw": base_score_raw,
-                "combo_score_raw": combo_score_raw,
-                "fist_angry_bonus_raw": fist_angry_bonus_raw,
-                "fist_motion_bonus_raw": fist_motion_bonus_raw,
-                "angry_motion_bonus_raw": angry_motion_bonus_raw,
-                "brow_down": brow_down,
-                "eye_squint": eye_squint,
-                "lip_press": lip_press,
-                "nose_sneer": nose_sneer,
-                "smile": smile,
-                "angry_face_score": angry_face_score,
-                "fist_count": fist_count,
-                "has_fist": has_fist,
+                "brow_down":            brow_down,
+                "eye_squint":           eye_squint,
+                "lip_press":            lip_press,
+                "nose_sneer":           nose_sneer,
+                "smile":                smile,
+                "angry_face_score":     angry_face_score,
+                "fist_count":           fist_count,
+                "has_fist":             has_fist,
+                "hand_movement_score":  hand_movement_score,
                 "left_hand_speed_norm": left_hand_speed_norm,
-                "right_hand_speed_norm": right_hand_speed_norm,
-                "hand_movement_score": hand_movement_score,
-                "forward_lean": forward_lean,
-                "torso_center": torso_center,
-                "watch_threshold": WATCH_THRESHOLD,
-                "aggressive_threshold": AGGRESSIVE_THRESHOLD,
-            }
+                "right_hand_speed_norm":right_hand_speed_norm,
+                "base_score":           base_score,
+                "combo_score":          combo_score,
+                "fist_angry_bonus":     fist_angry_bonus,
+                "fist_motion_bonus":    fist_motion_bonus,
+                "angry_motion_bonus":   angry_motion_bonus,
+            },
         }

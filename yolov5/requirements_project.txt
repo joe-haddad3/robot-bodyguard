@@ -29,3 +29,7 @@ seaborn>=0.12.0
 pandas>=1.5.0
 psutil>=5.9.0
 thop>=0.1.1
+
+# Tracking
+ultralytics>=8.4.14
+lap>=0.5.13

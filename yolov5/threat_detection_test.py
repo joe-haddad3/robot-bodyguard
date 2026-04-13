@@ -1,41 +1,52 @@
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
 import cv2
 import torch
 import math
 import time
 import os
+import threading
+import numpy as np
+
+from types import SimpleNamespace
 from collections import deque, defaultdict
 
 from enhanced_threat_analyzer import EnhancedThreatAnalyzer
-from camera_utils import LatestFrameCamera
-from owner_recognizer_facenet import FaceNetOwnerRecognizer
+from camera_utils import LatestFrameCamera, make_camera
+from owner_recognizer_facenet import FaceNetOwnerRecognizer, cosine_distance
+from clip_owner_recognizer import CLIPOwnerRecognizer, cosine_similarity as clip_cosine_similarity
+from enhanced_tracking import (
+    MotionPredictor, AdaptiveFingerprint, ObstacleDetector,
+    BodyguardConfig, EnhancedPersonTracker, PersonReIDStore,
+    draw_angle_indicator, draw_confidence_bar
+)
+from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.engine.results import Boxes
+
+# Helper to distinguish which recognizer is active without circular imports
+# “Try to get the attribute recognizer_type from the object”
+# If it exists → use its value
+# If it doesn’t exist → use default 'facenet'
+def _is_clip(recognizer):
+    return getattr(recognizer, 'recognizer_type', 'facenet') == 'clip'
 
 # -----------------------------
-# PLATFORM MODE
-# Set RPI_MODE = True when running on Raspberry Pi 5
+# CONFIGURATION
 # -----------------------------
-RPI_MODE = False
-# -----------------------------
-# CAMERA / MODEL SETTINGS
-# -----------------------------
-CAMERA_INDEX = 0  # change if needed (RPi camera module: usually 0)
-CAM_W = 640
-CAM_H = 480
-CAM_FPS = 15
-YOLO_EVERY = 2
+config = BodyguardConfig()
+if config.rpi_mode:
+    config.update_for_rpi()
 
-if RPI_MODE:
-    CAM_W = 320
-    CAM_H = 240
-    CAM_FPS = 10
-    YOLO_EVERY = 5
+# Override with local settings
+CAM_W = config.camera_width
+CAM_H = config.camera_height
+CAM_FPS = config.camera_fps
+YOLO_EVERY = config.yolo_every_n_frames if config.rpi_mode else 1
+
+# Camera settings
+CAMERA_INDEX = 0  # Default camera index
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 
-cam = LatestFrameCamera(
+cam = make_camera(
     src=CAMERA_INDEX,
     width=CAM_W,
     height=CAM_H,
@@ -50,7 +61,65 @@ model = torch.hub.load(
     force_reload=False
 )
 
-model.conf = 0.15
+# YOLO confidence threshold is set low so ByteTrack can use lower-confidence
+# boxes during second-stage association, which is the core of why ByteTrack
+# survives blur, partial turns, and brief occlusion better than a naive tracker.
+model.conf = 0.10
+                    
+
+
+# -----------------------------
+# ASYNC YOLO RUNNER
+# Runs YOLO inference in a background thread (YOLO inference is slow) so the main loop
+# never blocks waiting for detection. The main loop submits a
+# frame every YOLO_EVERY frames and immediately reads the latest
+# completed result — display stays fluid even when YOLO is slow.
+# -----------------------------
+class AsyncYOLO:
+    def __init__(self, yolo_model):
+        self._model       = yolo_model
+        self._det_lock    = threading.Lock()
+        self._frame_lock  = threading.Lock()
+        self._detections  = np.empty((0, 6), dtype=np.float32)
+        self._result_seq  = 0
+        self._new_frame   = None
+        self._frame_ready = threading.Event()
+        self._thread      = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def submit(self, frame):
+        """Queue a frame for inference. Non-blocking — drops any unprocessed queued frame."""
+        with self._frame_lock:
+            self._new_frame = frame.copy()
+        self._frame_ready.set()
+
+    @property
+    def detections(self):
+        """Latest completed detection result — numpy array (N, 6) [x1,y1,x2,y2,conf,cls]."""
+        with self._det_lock:
+            return self._detections
+
+    def latest_result(self):
+        """Return the latest detections plus a monotonically increasing result id."""
+        with self._det_lock:
+            return self._detections.copy(), self._result_seq
+
+    def _worker(self):
+        while True:
+            self._frame_ready.wait()
+            self._frame_ready.clear()
+            with self._frame_lock:
+                frame = self._new_frame
+            if frame is None:
+                continue
+            results = self._model(frame)
+            dets = results.xyxy[0].cpu().numpy()
+            with self._det_lock:
+                self._detections = dets
+                self._result_seq += 1
+
+
+yolo_runner = AsyncYOLO(model)
 
 
 # -----------------------------
@@ -68,31 +137,13 @@ WEAPON_CLASSES = {"knife", "gun", "baseball_bat", "hammer"}
 
 
 # -----------------------------
-# THRESHOLDS
+# THRESHOLDS (from config)
 # -----------------------------
-ENTRY_THRESHOLDS = {
-    "person": 0.65,   # raised from 0.50 — reduces false positives (coats, chairs, etc.)
-    "knife": 0.7,
-    "gun": 0.65,
-    "baseball_bat": 0.9,
-    "hammer": 0.40,
-}
+ENTRY_THRESHOLDS = config.entry_thresholds
+KEEP_THRESHOLDS = config.keep_thresholds
 
-KEEP_THRESHOLDS = {
-    "person": 0.40,   # raised from 0.20 — drop track quickly if confidence falls
-    "knife": 0.35,
-    "gun": 0.7,
-    "baseball_bat": 0.9,
-    "hammer": 0.30,
-}
-
-# Person box must pass these checks to be accepted as a real person
-PERSON_MIN_HEIGHT  = 80    # pixels — filters tiny detections
-PERSON_MIN_WIDTH   = 40    # pixels
-PERSON_MIN_ASPECT  = 1.1   # height/width — people are taller than wide
-
-PERSON_MISSING_FRAMES = 40
-OBJECT_MISSING_FRAMES = 15
+PERSON_MISSING_FRAMES = config.person_missing_frames
+OBJECT_MISSING_FRAMES = config.object_missing_frames
 
 CLASS_CONFIRM_FRAMES = {
     "person": 1,
@@ -111,22 +162,49 @@ CLASS_PRIORITY = {
     "baseball_bat": 1,
 }
 
-FACE_FALLBACK_ENABLED = True
+FACE_MIN_SIZE = (60, 60)
+
+# How often (frames) to try extracting face embeddings for persons who don't have one yet
+FACE_UPDATE_EVERY = 15
+
+# CLIP is expensive on RPi CPU — only run recognition every N frames.
+# FaceNet is fast enough to run every OWNER_RECOGNITION_EVERY frames as before.
+CLIP_RECOGNITION_EVERY = 45 if config.rpi_mode else 20  # ~3s RPi / ~1s PC at 15fps
+
+# Minimum pixel change ratio WITHIN a person's bounding box crop
+# required to re-run MediaPipe models on that person.
+# 3% change in their crop means they visibly moved — otherwise use cached result.
+PERSON_MOVEMENT_THRESHOLD = 0.03
+
+# MSE motion gate: skip submitting to YOLO when the scene is completely static
+# and no persons are currently tracked. Threshold tuned for 640×480; scale up
+# proportionally for higher resolutions.
+_MOTION_MSE_THRESHOLD = 150.0
+_prev_gray_for_motion = None
+
+def _has_motion(frame_bgr):
+    """Return True if the frame differs enough from the previous one (MSE gate)."""
+    global _prev_gray_for_motion
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if _prev_gray_for_motion is None or _prev_gray_for_motion.shape != gray.shape:
+        _prev_gray_for_motion = gray
+        return True
+    mse = float(np.mean(
+        (gray.astype(np.float32) - _prev_gray_for_motion.astype(np.float32)) ** 2
+    ))
+    _prev_gray_for_motion = gray
+    return mse > _MOTION_MSE_THRESHOLD
 
 # -----------------------------
-# OWNER RECOGNITION
+# OWNER RECOGNITION (from config)
 # -----------------------------
-OWNER_RECOGNITION_ENABLED = False
-OWNER_RECOGNITION_EVERY = 2
-OWNER_DISTANCE_THRESHOLD = 0.45   # 0.30 too strict for live vs photo enrollment; strangers ~0.55+
-OWNER_CONFIRM_FRAMES = 2          # consecutive matching frames needed to confirm owner
-FACE_EXPAND = 0.10
-MIN_OWNER_FACE_SIZE = 60
-
-if RPI_MODE:
-    # Face recognition is slow on CPU — run less often
-    OWNER_RECOGNITION_EVERY = 15
-    MIN_OWNER_FACE_SIZE = 30
+OWNER_RECOGNITION_ENABLED = config.owner_recognition_enabled
+OWNER_RECOGNITION_EVERY = config.owner_recognition_every
+OWNER_DISTANCE_THRESHOLD = config.owner_distance_threshold   # enrolled samples score 0.02-0.15 vs mean; live ~2x; strangers ~0.50+
+OWNER_CONFIRM_FRAMES = config.owner_confirm_frames          # must match 3 consecutive frames to avoid false positives
+OWNER_LOST_FRAMES_THRESHOLD = config.owner_lost_frames_threshold
+FACE_EXPAND = config.face_expand
+MIN_OWNER_FACE_SIZE = config.min_owner_face_size
 
 
 # -----------------------------
@@ -136,17 +214,79 @@ next_person_id = 0
 next_object_id = 0
 
 active_persons = {}
+# Tracks that are being held in a grace period while we collect features
+# and attempt re-identification before committing to a new person ID.
+# Structure: track_id → {bbox, conf, first_seen, face_emb, hists: []}
+pending_tracks = {}
+PENDING_GRACE_SECONDS = 0.5   # max time before forcing resolution
+
 active_objects = {}
 object_class_history = {}
 switch_candidate_history = defaultdict(lambda: deque(maxlen=5))
 
-threat_analyzer = EnhancedThreatAnalyzer(rpi_mode=RPI_MODE)
+threat_analyzer = EnhancedThreatAnalyzer(config=config)
 recognized_owner_id = None
+owner_lock_loss_count = 0
+owner_profile = None
+owner_prediction_streak = 0  # Consecutive frames maintained by prediction
 
+# Dual recognizer strategy:
+#   owner_recognizer = FaceNet (primary, fast, face-based — always loaded)
+#   clip_recognizer  = CLIP    (fallback, slow, body-based — used only when
+#                               FaceNet finds no face in a person crop, e.g. turned away)
+#
+# FaceNet handles frontal / angled faces well.
+# CLIP handles back-to-camera, covered face, or heavy occlusion.
+# Both can run together — whichever finds a confident match updates the streak.
 owner_recognizer = FaceNetOwnerRecognizer(threshold=OWNER_DISTANCE_THRESHOLD)
 
+clip_recognizer = None   # populated below if CLIP is installed + gallery exists
+try:
+    _cr = CLIPOwnerRecognizer(threshold=0.82)
+    if _cr.enabled:
+        if _cr.get_gallery_size() > 0:
+            clip_recognizer = _cr
+            print(f"[INIT] CLIP fallback recognizer loaded ({clip_recognizer.get_gallery_size()} gallery items)")
+        else:
+            print("[INIT] CLIP installed but gallery is empty — run enroll_owner_clip.py to enable back/side recognition")
+    else:
+        print("[INIT] CLIP not available (install: pip install git+https://github.com/openai/CLIP.git)")
+except Exception as e:
+    print(f"[INIT] CLIP load failed: {e} — face-only recognition active")
+
+# Enhanced tracking components
+enhanced_tracker = EnhancedPersonTracker(config)
+
+# Ultralytics ByteTrack defaults, mirroring the official bytetrack.yaml config.
+BYTE_TRACKER_ARGS = SimpleNamespace(
+    tracker_type="bytetrack",
+    track_high_thresh=0.25,
+    track_low_thresh=0.10,
+    new_track_thresh=0.25,
+    track_buffer=30 if not config.rpi_mode else 60,
+    match_thresh=0.80,
+    fuse_score=True,
+)
+byte_tracker = BYTETracker(BYTE_TRACKER_ARGS, frame_rate=CAM_FPS)
+
+# Face-based re-identification store.
+# One job: face embedding → stable display ID.
+reid_store = PersonReIDStore()
+
+# Fallback display-ID counter for persons whose face was never seen
+obstacle_detector = ObstacleDetector()
+
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
 frame_count = 0
-detections = []
+raw_detections = []
+last_yolo_result_seq = -1
+
+# Per-person grayscale crop cache — used to detect whether a person
+# moved since the last frame before running expensive MediaPipe models.
+person_prev_crops = {}   # track_id -> grayscale crop (numpy array)
 
 
 # -----------------------------
@@ -174,6 +314,25 @@ def bbox_height(box):
 
 def distance(a, b):
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
+def box_intersection_area(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    return interW * interH
+
+
+def box_visibility_ratio(box, frame_shape):
+    fh, fw = frame_shape[:2]
+    frame_box = [0, 0, fw, fh]
+    inter = box_intersection_area(box, frame_box)
+    area = bbox_area(box)
+    return inter / area if area > 0 else 0.0
 
 
 def iou(boxA, boxB):
@@ -223,13 +382,13 @@ def draw_text_block(frame, lines, x, y, color):
                 line,
                 (x, yy),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.35,
                 color,
                 1
             )
 
 
-def match_detection_to_tracks(det_box, tracks, iou_threshold=0.25, dist_threshold=250, skip_ids=None):
+def match_detection_to_tracks(det_box, tracks, iou_threshold=0.20, dist_threshold=250, skip_ids=None, frame=None):
     if skip_ids is None:
         skip_ids = set()
 
@@ -238,6 +397,7 @@ def match_detection_to_tracks(det_box, tracks, iou_threshold=0.25, dist_threshol
 
     det_center = bbox_center(det_box)
 
+    # First pass: IoU matching (most reliable)
     for tid, t in tracks.items():
         if tid in skip_ids:
             continue
@@ -250,15 +410,57 @@ def match_detection_to_tracks(det_box, tracks, iou_threshold=0.25, dist_threshol
     if best_id is not None:
         return best_id
 
-    best_dist = float("inf")
+    # Second pass: Distance + fingerprint matching
+    best_score = -1e9
+    best_fp_score = 0.0
+
     for tid, t in tracks.items():
         if tid in skip_ids:
             continue
         track_center = bbox_center(t["bbox"])
         d = distance(det_center, track_center)
-        if d < dist_threshold and d < best_dist:
-            best_dist = d
-            best_id = tid
+
+        # Relaxed distance check (increased from 250 to 350 for multi-person tolerance)
+        if d < dist_threshold:
+            # Base score inversely proportional to distance
+            score = 2.0 / (1.0 + d * 0.01)
+
+            # Add fingerprint comparison if available (enhanced with skeletal features)
+            fp_score = 0.0
+            if frame is not None and tid in enhanced_tracker.fingerprints:
+                fp_score = enhanced_tracker.compare_fingerprint(tid, frame, det_box, enhanced=True)
+                best_fp_score = max(best_fp_score, fp_score)
+                
+                # Boost score significantly if fingerprint matches well
+                if fp_score > 0.80:
+                    score += 3.0  # Strong match
+                elif fp_score > 0.65:
+                    score += 1.5  # Good match
+                elif fp_score > 0.50:
+                    score += 0.8  # Moderate match
+                elif fp_score > 0.35:
+                    score += 0.3  # Weak match
+
+            if score > best_score:
+                best_score = score
+                best_id = tid
+
+    # If top fingerprint score is very high, prefer that match over distance alone
+    if best_id is not None and best_fp_score > 0.75:
+        return best_id
+
+    # Third pass: Motion prediction matching (for lost tracks)
+    if best_id is None and frame is not None:
+        for tid in tracks.keys():
+            if tid in skip_ids:
+                continue
+
+            predicted_box = enhanced_tracker.predict_person_position(tid, frame)
+            if predicted_box:
+                pred_iou = iou(det_box, predicted_box)
+                if pred_iou > 0.15:
+                    best_id = tid
+                    break
 
     return best_id
 
@@ -271,17 +473,25 @@ def should_keep_existing(class_name, conf):
     return conf >= KEEP_THRESHOLDS.get(class_name, 0.35)
 
 
-def face_box_to_person_box(face_box, frame_shape):
-    """Expand an MTCNN face box (x1,y1,x2,y2) to an estimated full-body box."""
-    fx1, fy1, fx2, fy2 = face_box
-    H, W = frame_shape[:2]
-    fw = fx2 - fx1
-    fh = fy2 - fy1
+def detect_faces(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=FACE_MIN_SIZE
+    )
+    return faces
 
-    x1 = max(0, int(fx1 - 0.6 * fw))
-    y1 = max(0, int(fy1 - 0.4 * fh))
-    x2 = min(W - 1, int(fx2 + 0.6 * fw))
-    y2 = min(H - 1, int(fy2 + 3.5 * fh))
+
+def face_to_person_box(face, frame_shape):
+    x, y, w, h = face
+    H, W = frame_shape[:2]
+
+    x1 = max(0, int(x - 0.8 * w))
+    y1 = max(0, int(y - 0.6 * h))
+    x2 = min(W - 1, int(x + w + 0.8 * w))
+    y2 = min(H - 1, int(y + h + 2.8 * h))
 
     return [x1, y1, x2, y2]
 
@@ -313,11 +523,52 @@ def maybe_switch_object_class(object_id, candidate_class, candidate_conf):
         switch_candidate_history[object_id].clear()
 
 
+def expand_face_box(face_box, frame_shape, expand_ratio=0.10):
+    x, y, w, h = face_box
+    H, W = frame_shape[:2]
+
+    pad_x = int(w * expand_ratio)
+    pad_y = int(h * expand_ratio)
+
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(W, x + w + pad_x)
+    y2 = min(H, y + h + pad_y)
+
+    return (x1, y1, x2, y2)
+
 
 def detect_faces_full_frame(frame_bgr):
-    # Use MTCNN (via owner_recognizer) for accurate detection + alignment.
-    # Returns face_tensor (pre-aligned, ready for FaceNet) instead of raw crop.
-    return owner_recognizer.detect_faces(frame_bgr)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=FACE_MIN_SIZE
+    )
+
+    results = []
+    for (x, y, w, h) in faces:
+        if w < MIN_OWNER_FACE_SIZE or h < MIN_OWNER_FACE_SIZE:
+            continue
+
+        x1, y1, x2, y2 = expand_face_box((x, y, w, h), frame_bgr.shape, FACE_EXPAND)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        face_crop_bgr = frame_bgr[y1:y2, x1:x2]
+        if face_crop_bgr.size == 0:
+            continue
+
+        results.append({
+            "face_box": (x1, y1, x2, y2),
+            "face_crop_bgr": face_crop_bgr,
+            "center": ((x1 + x2) / 2, (y1 + y2) / 2),
+            "raw_face": (x, y, w, h),
+        })
+
+    return results
 
 
 def match_faces_to_persons(detected_faces, persons):
@@ -370,8 +621,49 @@ def match_faces_to_persons(detected_faces, persons):
     return assignments
 
 
-def run_owner_recognition(frame):
-    global recognized_owner_id
+def _try_extract_face_emb(frame, box):
+    """
+    Try to find a face in the upper 55 % of a person box and return its FaceNet embedding.
+    Returns a (512,) float32 numpy array, or None if no face was found.
+
+    """
+    if not owner_recognizer.enabled:
+        return None
+    x1, y1, x2, y2 = (int(v) for v in box)
+    H, W = frame.shape[:2]
+    face_y2 = y1 + int((y2 - y1) * 0.55)
+    crop = frame[max(0, y1):min(H, face_y2), max(0, x1):min(W, x2)]
+    if crop.size == 0:
+        return None
+    gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 3, minSize=(20, 20))
+    if len(faces) == 0:
+        return None
+    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+    if fw < MIN_OWNER_FACE_SIZE or fh < MIN_OWNER_FACE_SIZE:
+        return None
+    pad_x = int(fw * FACE_EXPAND)
+    pad_y = int(fh * FACE_EXPAND)
+    fc = crop[max(0, fy - pad_y):min(crop.shape[0], fy + fh + pad_y),
+               max(0, fx - pad_x):min(crop.shape[1], fx + fw + pad_x)]
+    if fc.size == 0:
+        return None
+    return owner_recognizer.embed_face_rgb(cv2.cvtColor(fc, cv2.COLOR_BGR2RGB))
+
+
+def run_owner_recognition_in_yolo_boxes(frame):
+    """Search for the owner inside each tracked person bounding box.
+
+    FaceNet (primary) — runs every call for every person:
+      1. Haar cascade inside upper 55 % → precise face crop
+      2. Full upper crop to FaceNet if Haar misses → angled / partial faces
+
+    CLIP (fallback per person) — runs only when FaceNet found no usable face
+      AND clip_recognizer is loaded AND this is a CLIP-scheduled frame:
+      - Full body crop — works with back-to-camera, covered face, side views
+      - Rate-limited by CLIP_RECOGNITION_EVERY to protect RPi CPU
+    """
+    global recognized_owner_id, owner_profile, owner_lock_loss_count
 
     if not OWNER_RECOGNITION_ENABLED:
         recognized_owner_id = None
@@ -380,37 +672,99 @@ def run_owner_recognition(frame):
     if recognized_owner_id is not None and recognized_owner_id in active_persons:
         return
 
-    for pid, pdata in active_persons.items():
+    for pdata in active_persons.values():
         pdata["face_box_global"] = None
         pdata["owner_distance"] = 999.0
         pdata["owner_label"] = "UNKNOWN"
 
-    detected_faces = detect_faces_full_frame(frame)
-    face_assignments = match_faces_to_persons(detected_faces, active_persons)
-
+    H, W = frame.shape[:2]
     best_pid = None
     best_dist = 999.0
+    best_face_crop = None
+    _clip_frame_ok = (clip_recognizer is not None) and (frame_count % CLIP_RECOGNITION_EVERY == 0)
 
     for pid, pdata in active_persons.items():
-        if not pdata["confirmed"]:
+        if not pdata.get("confirmed", False):
             continue
 
-        face_info = face_assignments.get(pid, None)
+        x1, y1, x2, y2 = int(pdata["bbox"][0]), int(pdata["bbox"][1]), int(pdata["bbox"][2]), int(pdata["bbox"][3])
 
-        if face_info is None:
-            pdata["owner_match_streak"] = 0
-            continue
+        dist     = 999.0
+        is_owner = False
+        face_found = False  # True when FaceNet managed to find a face in this crop
 
-        pdata["face_box_global"] = face_info["face_box"]
+        # ── FaceNet (primary) — works whenever the face is at least partially visible ──
+        face_y2 = y1 + int((y2 - y1) * 0.55)
+        cx1 = max(0, x1); cy1 = max(0, y1)
+        cx2 = min(W, x2); cy2 = min(H, face_y2)
 
-        # recognize_tensor uses the pre-aligned MTCNN tensor — much more accurate
-        result = owner_recognizer.recognize_tensor(face_info["face_tensor"])
+        if cx2 > cx1 and cy2 > cy1:
+            person_crop = frame[cy1:cy2, cx1:cx2]
+            if person_crop.size > 0:
+                face_crop_rgb  = None
+                face_box_global = None
 
-        dist = float(result.get("distance", 999.0))
-        is_owner = dist < OWNER_DISTANCE_THRESHOLD
+                # Attempt 1: Haar cascade
+                gray_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(
+                    gray_crop, scaleFactor=1.1, minNeighbors=3, minSize=(20, 20)
+                )
+                if len(faces) > 0:
+                    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+                    if fw >= MIN_OWNER_FACE_SIZE and fh >= MIN_OWNER_FACE_SIZE:
+                        pad_x = int(fw * FACE_EXPAND); pad_y = int(fh * FACE_EXPAND)
+                        fx1 = max(0, fx - pad_x); fy1 = max(0, fy - pad_y)
+                        fx2 = min(person_crop.shape[1], fx + fw + pad_x)
+                        fy2 = min(person_crop.shape[0], fy + fh + pad_y)
+                        face_crop_bgr = person_crop[fy1:fy2, fx1:fx2]
+                        if face_crop_bgr.size > 0:
+                            face_crop_rgb   = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
+                            face_box_global = (cx1 + fx1, cy1 + fy1, cx1 + fx2, cy1 + fy2)
 
+                # Attempt 2: full upper crop as face input (angled / partial face)
+                if face_crop_rgb is None and min(person_crop.shape[:2]) >= MIN_OWNER_FACE_SIZE:
+                    face_crop_rgb  = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+                    face_box_global = (cx1, cy1, cx2, cy2)
+
+                if face_crop_rgb is not None:
+                    face_found = True
+                    pdata["face_box_global"] = face_box_global
+
+                    face_emb = owner_recognizer.embed_face_rgb(face_crop_rgb)
+                    stable_id = pdata.get('stable_id')
+                    if stable_id:
+                        reid_store.update_face(stable_id, face_emb)
+
+                    mean_dist = (
+                        1.0 - float(np.dot(face_emb, owner_recognizer.mean_embedding))
+                        if owner_recognizer.mean_embedding is not None else 999.0
+                    )
+                    sample_dists     = [1.0 - float(np.dot(face_emb, ref)) for ref in owner_recognizer.owner_embeddings]
+                    best_sample_dist = min(sample_dists) if sample_dists else 999.0
+                    dist     = float(mean_dist)
+                    is_owner = dist < OWNER_DISTANCE_THRESHOLD and best_sample_dist < OWNER_DISTANCE_THRESHOLD
+                    if is_owner:
+                        best_face_crop = face_crop_rgb
+
+        # ── CLIP (fallback) — kicks in when face is turned away / covered ──────
+        # Only runs when FaceNet found no usable face AND the CLIP gallery is ready
+        # AND this is a frame where CLIP inference is scheduled (rate-limited).
+        if not face_found and _clip_frame_ok:
+            bx1 = max(0, x1); by1 = max(0, y1)
+            bx2 = min(W, x2); by2 = min(H, y2)
+            if bx2 > bx1 and by2 > by1:
+                body_crop = frame[by1:by2, bx1:bx2]
+                if body_crop.size > 0:
+                    clip_result = clip_recognizer.recognize(body_crop)
+                    # Use CLIP result only if it's more confident than FaceNet gave us
+                    if clip_result["distance"] < dist:
+                        dist     = clip_result["distance"]
+                        is_owner = clip_result["is_owner"]
+                    pdata["face_box_global"] = None  # no face box for CLIP path
+
+        # ── Update streak and pick the best candidate this frame ──────────────
         pdata["owner_distance"] = dist
-        pdata["owner_label"] = "OWNER" if is_owner else "UNKNOWN"
+        pdata["owner_label"]    = "OWNER" if is_owner else "UNKNOWN"
 
         if is_owner:
             pdata["owner_match_streak"] = pdata.get("owner_match_streak", 0) + 1
@@ -419,13 +773,149 @@ def run_owner_recognition(frame):
 
         if pdata["owner_match_streak"] >= OWNER_CONFIRM_FRAMES and dist < best_dist:
             best_dist = dist
-            best_pid = pid
+            best_pid  = pid
 
     if best_pid is not None:
         recognized_owner_id = best_pid
+        owner_lock_loss_count = 0
+        owner_profile = build_owner_profile(frame, active_persons[best_pid]["bbox"], best_face_crop)
+        owner_stable = active_persons[best_pid].get('stable_id')
+        if owner_stable is None and owner_profile.get("face_embedding") is not None:
+            owner_rec = reid_store.find_match(owner_profile["face_embedding"], cosine_distance)
+            if owner_rec is None:
+                owner_rec = reid_store.register(owner_profile["face_embedding"], is_owner=True)
+            owner_stable = owner_rec["stable_id"]
+            active_persons[best_pid]["stable_id"] = owner_stable
+        if owner_stable:
+            reid_store.mark_owner(owner_stable)
+        via = "FaceNet+CLIP" if (best_face_crop is None and clip_recognizer) else "FaceNet"
+        print(f"[DEBUG] Built owner profile for {best_pid} via {via}")
         for pid in active_persons:
             active_persons[pid]["owner_confirmed"] = (pid == recognized_owner_id)
             active_persons[pid]["identity"] = "owner" if pid == recognized_owner_id else "unknown"
+
+
+def build_owner_profile(frame, box, face_rgb=None, pose_landmarks=None):
+    profile = {
+        "face_embedding": None,
+        "fingerprint": AdaptiveFingerprint(),
+        "last_seen_box": box,
+        "last_seen_frame": frame_count,
+        "lost_frames": 0,
+    }
+
+    # Build fingerprint with pose landmarks if available
+    if pose_landmarks:
+        profile["fingerprint"].build_with_pose(frame, box, pose_landmarks, enhanced=True)
+    else:
+        profile["fingerprint"].build(frame, box, enhanced=True)
+
+    if face_rgb is not None and owner_recognizer.enabled:
+        profile["face_embedding"] = owner_recognizer.embed_face_rgb(face_rgb)
+    return profile
+
+
+def update_owner_profile(frame, box, face_rgb=None, score=1.0, pose_landmarks=None):
+    global owner_profile
+    if owner_profile is None:
+        owner_profile = build_owner_profile(frame, box, face_rgb, pose_landmarks)
+        return
+
+    owner_profile["last_seen_box"] = box
+    owner_profile["last_seen_frame"] = frame_count
+    owner_profile["lost_frames"] = 0
+    owner_profile["fingerprint"].update(frame, box, score)
+
+    # Update skeletal signatures if pose landmarks are available and we don't have them yet
+    if pose_landmarks and owner_profile["fingerprint"].skeletal_signatures is None:
+        owner_profile["fingerprint"].skeletal_signatures = owner_profile["fingerprint"]._extract_skeletal_signatures(pose_landmarks)
+
+    if face_rgb is not None and owner_recognizer.enabled:
+        owner_profile["face_embedding"] = owner_recognizer.embed_face_rgb(face_rgb)
+
+
+def recover_owner_by_profile(frame):
+    """Scan active persons for the owner when recognized_owner_id is None.
+
+    Three paths, tried in order (cheapest/fastest first):
+
+    FaceNet path — compares face embeddings against the saved face_embedding
+                   stored in owner_profile. Fast, but requires a visible face.
+
+    CLIP path  — compares each person's full body crop against the gallery.
+                 Called only every CLIP_RECOGNITION_EVERY frames (expensive).
+                 Works with back-to-camera, covered face, side views.
+
+    Fingerprint path — compares each person's clothing/appearance histogram
+                       against the enhanced fingerprint built when the owner was
+                       first recognised. Cheap (no model inference), runs every
+                       frame. Works even when the face is fully hidden and CLIP
+                       is not installed.  Threshold 0.72 — clothing similarity
+                       must be high enough to avoid false positives between
+                       people with similar outfits.
+    """
+    H, W = frame.shape[:2]
+
+    # ── FaceNet: compare face against saved profile embedding ─────────────────
+    best_pid   = None
+    best_sim   = 0.0
+
+    if owner_profile is not None and owner_profile.get("face_embedding") is not None:
+        for pid, pdata in active_persons.items():
+            if pid == recognized_owner_id:
+                continue
+            face_emb = _try_extract_face_emb(frame, pdata["bbox"])
+            if face_emb is None:
+                continue
+            sim = max(0.0, 1.0 - cosine_distance(face_emb, owner_profile["face_embedding"]))
+            if sim >= 0.68 and sim > best_sim:
+                best_sim = sim
+                best_pid = pid
+
+    if best_pid is not None:
+        return best_pid  # FaceNet found them — no need for CLIP or fingerprint
+
+    # ── CLIP fallback: gallery match on body crops when face not visible ───────
+    # Rate-limited: CLIP is expensive on RPi CPU
+    if clip_recognizer is not None and clip_recognizer.owner_gallery and frame_count % CLIP_RECOGNITION_EVERY == 0:
+        for pid, pdata in active_persons.items():
+            if pid == recognized_owner_id:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in pdata["bbox"]]
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(W, x2); y2 = min(H, y2)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            result = clip_recognizer.recognize(crop)
+            if result["is_owner"] and result["similarity"] > best_sim:
+                best_sim = result["similarity"]
+                best_pid = pid
+
+    if best_pid is not None:
+        return best_pid  # CLIP found them — no need for fingerprint
+
+    # ── Fingerprint fallback: clothing/appearance histogram match ─────────────
+    # Runs every frame (cheap), works even when face is completely hidden and
+    # CLIP is not installed. Uses the enhanced fingerprint (zone hists, edges,
+    # HOG, spatial colour) built when the owner was first recognised.
+    if owner_profile is not None:
+        fp = owner_profile.get("fingerprint")
+        if fp is not None and fp.base_color_hist is not None:
+            for pid, pdata in active_persons.items():
+                if pid == recognized_owner_id:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in pdata["bbox"]]
+                x1 = max(0, x1); y1 = max(0, y1)
+                x2 = min(W, x2); y2 = min(H, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                score = fp.compare(frame, [x1, y1, x2, y2], enhanced=fp.needs_enhanced)
+                if score > 0.72 and score > best_sim:
+                    best_sim = score
+                    best_pid = pid
+
+    return best_pid
 
 
 def make_hand_zone(person_box):
@@ -521,7 +1011,7 @@ def assign_weapons_to_people(active_persons, active_objects):
     return assignments
 
 
-def update_person_track(person_id, box, conf, source):
+def update_person_track(person_id, box, conf, source, frame=None):
     if person_id not in active_persons:
         return
 
@@ -530,10 +1020,10 @@ def update_person_track(person_id, box, conf, source):
 
     old_box = active_persons[person_id]["bbox"]
     smoothed_box = [
-        int(0.7 * old_box[0] + 0.3 * box[0]),
-        int(0.7 * old_box[1] + 0.3 * box[1]),
-        int(0.7 * old_box[2] + 0.3 * box[2]),
-        int(0.7 * old_box[3] + 0.3 * box[3]),
+        int(0.8 * old_box[0] + 0.2 * box[0]),
+        int(0.8 * old_box[1] + 0.2 * box[1]),
+        int(0.8 * old_box[2] + 0.2 * box[2]),
+        int(0.8 * old_box[3] + 0.2 * box[3]),
     ]
 
     active_persons[person_id]["bbox"] = smoothed_box
@@ -543,10 +1033,44 @@ def update_person_track(person_id, box, conf, source):
     active_persons[person_id]["confirmed"] = True
     active_persons[person_id]["source"] = source
 
+    if frame is not None:
+        enhanced_tracker.update_person(person_id, smoothed_box, frame, smoothed_conf)
+
+
+def ensure_active_person_track(track_id, box, conf, source="bytetrack", frame=None):
+    """Keep a visible person box alive immediately, even while identity is still resolving."""
+    if track_id in active_persons:
+        update_person_track(track_id, box, conf, source, frame)
+        return active_persons[track_id]
+
+    active_persons[track_id] = {
+        "bbox": box,
+        "conf": conf,
+        "missing": 0,
+        "identity": "unknown",
+        "seen_count": 1,
+        "confirmed": True,
+        "source": source,
+        "owner_confirmed": False,
+        "owner_distance": 999.0,
+        "owner_label": "UNKNOWN",
+        "face_box_global": None,
+        "owner_match_streak": 0,
+        "stable_id": None,
+        "identifying": True,
+    }
+
+    if frame is not None and track_id not in enhanced_tracker.fingerprints:
+        enhanced_tracker.add_person(track_id, box, frame)
+    return active_persons[track_id]
+
 
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
+WINDOW_NAME = "Enhanced Threat Detection"
+DISPLAY_W, DISPLAY_H = 640, 480  # fixed display size regardless of capture resolution
+
 while True:
     frame = cam.read()
     if frame is None:
@@ -555,211 +1079,186 @@ while True:
 
     frame_count += 1
 
-    if frame_count % YOLO_EVERY == 0:
+    # =========================================================
+    # YOLO DETECTION
+    # On laptop we run a fresh detection every frame so tracking sees the
+    # current person position instead of stale boxes. The async path stays as
+    # an RPi fallback where throughput matters more than absolute freshness.
+    # =========================================================
+    if config.rpi_mode:
+        _motion = _has_motion(frame)
+        should_submit_yolo = bool(active_persons)
+        if not should_submit_yolo:
+            should_submit_yolo = (frame_count % YOLO_EVERY == 0 or yolo_runner.detections.shape[0] == 0)
+        if should_submit_yolo and (_motion or active_persons):
+            yolo_runner.submit(frame)
+        raw_detections, yolo_result_seq = yolo_runner.latest_result()
+        if yolo_result_seq != last_yolo_result_seq:
+            last_yolo_result_seq = yolo_result_seq
+    else:
         results = model(frame)
-        detections = results.xyxy[0].cpu().numpy()
+        raw_detections = results.xyxy[0].cpu().numpy()
 
-    current_person_detections = []
-    current_object_detections = []
-
-    # STEP 1: YOLO FILTERING
-    for det in detections:
+    # =========================================================
+    # PHASE 1: PERSON DETECTION + TRACKING
+    # =========================================================
+    person_rows = []
+    for det in raw_detections:
         x1, y1, x2, y2, conf, cls = det
         cls = int(cls)
         conf = float(conf)
-
         class_name = class_id_to_name(cls)
-        if class_name is None:
+        if class_name != "person":
+            continue
+        if conf < BYTE_TRACKER_ARGS.track_low_thresh:
+            continue
+        person_rows.append([float(x1), float(y1), float(x2), float(y2), conf, 0.0])
+
+    if person_rows:
+        person_boxes = Boxes(np.array(person_rows, dtype=np.float32), frame.shape[:2])
+    else:
+        person_boxes = Boxes(np.empty((0, 6), dtype=np.float32), frame.shape[:2])
+
+    tracked_rows = byte_tracker.update(person_boxes, img=frame)
+
+    previous_active_persons = active_persons
+    active_persons = {}
+    pending_tracks.clear()
+
+    for tracked_row in tracked_rows:
+        if len(tracked_row) < 7:
             continue
 
-        box = [int(x1), int(y1), int(x2), int(y2)]
+        x1, y1, x2, y2, track_id, conf, _cls = tracked_row[:7]
+        track_id = int(track_id)
+        bbox_list = [float(x1), float(y1), float(x2), float(y2)]
+        conf = float(conf)
 
-        if class_name == "person":
-            bw = box[2] - box[0]
-            bh = box[3] - box[1]
+        prev = previous_active_persons.get(track_id, {})
+        active_persons[track_id] = {
+            "bbox": bbox_list,
+            "conf": conf,
+            "missing": 0,
+            "identity": prev.get("identity", "unknown"),
+            "seen_count": prev.get("seen_count", 0) + 1,
+            "confirmed": True,
+            "source": "ultralytics_bytetrack",
+            "owner_confirmed": prev.get("owner_confirmed", False),
+            "owner_distance": prev.get("owner_distance", 999.0),
+            "owner_match_streak": prev.get("owner_match_streak", 0),
+            "owner_label": prev.get("owner_label", "UNKNOWN"),
+            "face_box_global": None,
+            "stable_id": prev.get("stable_id"),
+            "identifying": False,
+        }
 
-            # Reject boxes that are too small or wider than they are tall
-            # (coats on hooks, chairs, etc. often fail the aspect ratio check)
-            if bh < PERSON_MIN_HEIGHT or bw < PERSON_MIN_WIDTH:
-                continue
-            if bw > 0 and (bh / bw) < PERSON_MIN_ASPECT:
-                continue
-
-            matched_id = match_detection_to_tracks(
-                box,
-                active_persons,
-                iou_threshold=0.20,
-                dist_threshold=300
-            )
-
-            if matched_id is None:
-                if not should_accept_new(class_name, conf):
-                    continue
-            else:
-                if not should_keep_existing(class_name, conf):
-                    continue
-
-            current_person_detections.append({
-                "bbox": box,
-                "conf": conf,
-                "class_name": class_name,
-                "source": "yolo"
-            })
-
+        if track_id in enhanced_tracker.fingerprints:
+            enhanced_tracker.update_person(track_id, bbox_list, frame, conf)
         else:
-            matched_id = match_detection_to_tracks(
-                box,
-                active_objects,
-                iou_threshold=0.20,
-                dist_threshold=180
-            )
+            enhanced_tracker.add_person(track_id, bbox_list, frame)
 
-            if matched_id is None:
-                if not should_accept_new(class_name, conf):
-                    continue
-            else:
-                if not should_keep_existing(class_name, conf):
-                    continue
-
-            current_object_detections.append({
-                "bbox": box,
-                "conf": conf,
-                "class_name": class_name
-            })
-
-    # STEP 2: FACE FALLBACK (MTCNN — same detector used for owner recognition)
-    if FACE_FALLBACK_ENABLED:
-        mtcnn_faces = owner_recognizer.detect_faces(frame)
-        for face in mtcnn_faces:
-            pseudo_person_box = face_box_to_person_box(face["face_box"], frame.shape)
-
-            already_covered = False
-            for det in current_person_detections:
-                if iou(pseudo_person_box, det["bbox"]) > 0.25:
-                    already_covered = True
-                    break
-
-            if already_covered:
-                continue
-
-            current_person_detections.append({
-                "bbox": pseudo_person_box,
-                "conf": 0.99,
-                "class_name": "person",
-                "source": "face_fallback"
-            })
-
-    # STEP 3: UPDATE PERSONS
-    matched_person_ids = set()
-    used_detection_idxs = set()
-
-    # 3A: protect locked owner track first
-    if recognized_owner_id is not None and recognized_owner_id in active_persons:
-        owner_box = active_persons[recognized_owner_id]["bbox"]
-
-        best_idx = None
-        best_iou = -1.0
-        best_dist = float("inf")
-        owner_match_ok = False
-
-        for i, det in enumerate(current_person_detections):
-            box = det["bbox"]
-            ov = iou(box, owner_box)
-            d = distance(bbox_center(box), bbox_center(owner_box))
-
-            if ov > best_iou:
-                best_iou = ov
-                best_dist = d
-                best_idx = i
-            elif abs(ov - best_iou) < 1e-6 and d < best_dist:
-                best_dist = d
-                best_idx = i
-
-        if best_idx is not None:
-            det = current_person_detections[best_idx]
-            box = det["bbox"]
-            conf = det["conf"]
-            source = det.get("source", "yolo")
-
-            owner_match_ok = (best_iou >= 0.10) or (best_dist < 120)
-
-            if owner_match_ok:
-                update_person_track(recognized_owner_id, box, conf, source)
-                matched_person_ids.add(recognized_owner_id)
-                used_detection_idxs.add(best_idx)
-
-        if not owner_match_ok:
-            active_persons[recognized_owner_id]["owner_confirmed"] = False
-            active_persons[recognized_owner_id]["identity"] = "unknown"
-            active_persons[recognized_owner_id]["owner_match_streak"] = 0
-            active_persons[recognized_owner_id]["owner_distance"] = 999.0
-            active_persons[recognized_owner_id]["owner_label"] = "UNKNOWN"
-            active_persons[recognized_owner_id]["face_box_global"] = None
-            recognized_owner_id = None
-            # track stays alive — normal PERSON_MISSING_FRAMES grace applies
-
-    # 3B: match remaining detections to remaining tracks
-    for i, det in enumerate(current_person_detections):
-        if i in used_detection_idxs:
-            continue
-
-        box = det["bbox"]
-        conf = det["conf"]
-        source = det.get("source", "yolo")
-
-        skip_ids = {recognized_owner_id} if recognized_owner_id is not None else set()
-
-        person_id = match_detection_to_tracks(
-            box,
-            active_persons,
-            iou_threshold=0.20,
-            dist_threshold=300,
-            skip_ids=skip_ids
-        )
-
-        if person_id is None:
-            person_id = next_person_id
-            next_person_id += 1
-
-            active_persons[person_id] = {
-                "bbox": box,
-                "conf": conf,
-                "missing": 0,
-                "identity": "unknown",
-                "seen_count": 1,
-                "confirmed": True,
-                "source": source,
-                "owner_confirmed": False,
-                "owner_distance": 999.0,
-                "owner_label": "UNKNOWN",
-                "face_box_global": None,
-                "owner_match_streak": 0,
+    # ── Preserve tracks dropped temporarily by ByteTracker ──────────────────
+    # ByteTracker only outputs tracks it can actively match each frame.
+    # When a person moves fast or is briefly occluded, their track enters
+    # ByteTracker's internal "lost" pool (kept alive for track_buffer frames)
+    # but is NOT included in tracked_rows.  Without this block even a single
+    # missed frame wipes the entry from active_persons, clears
+    # recognized_owner_id, and forces a full face-recognition restart —
+    # which is why the owner box disappears the moment you move.
+    # Fix: carry every previous entry forward at the motion-predicted position
+    # for up to PERSON_MISSING_FRAMES frames.  Once ByteTracker re-associates
+    # the detection, the real tracked_rows entry takes over normally.
+    for old_pid, old_data in previous_active_persons.items():
+        if old_pid in active_persons:
+            continue  # ByteTracker is still actively tracking — no action needed
+        missing_count = old_data.get("missing", 0) + 1
+        if missing_count <= PERSON_MISSING_FRAMES:
+            predicted_box = enhanced_tracker.predict_person_position(old_pid, frame)
+            kept_box = predicted_box if predicted_box is not None else old_data["bbox"]
+            active_persons[old_pid] = {
+                **old_data,
+                "bbox": kept_box,
+                "missing": missing_count,
+                "source": "predicted",
             }
         else:
-            update_person_track(person_id, box, conf, source)
+            # Truly gone after grace period — clean up crop cache
+            person_prev_crops.pop(old_pid, None)
 
-        matched_person_ids.add(person_id)
-
-    for pid in list(active_persons.keys()):
-        if pid not in matched_person_ids:
-            active_persons[pid]["missing"] += 1
-
-            if active_persons[pid]["missing"] > PERSON_MISSING_FRAMES:
-                del active_persons[pid]
-                if recognized_owner_id == pid:
-                    recognized_owner_id = None
+    enhanced_tracker.cleanup_missing_tracks(active_persons.keys())
 
     if recognized_owner_id is not None and recognized_owner_id not in active_persons:
         recognized_owner_id = None
+        owner_lock_loss_count = 0
 
-    # STEP 4: OWNER RECOGNITION
+    # Update owner profile while the owner track is live
+    if recognized_owner_id is not None and recognized_owner_id in active_persons:
+        owner_box = active_persons[recognized_owner_id]["bbox"]
+        update_owner_profile(frame, owner_box, pose_landmarks=threat_analyzer.get_pose_landmarks(recognized_owner_id))
+
+    # Every FACE_UPDATE_EVERY frames: try to extract / refresh face embeddings
+    # for all active persons so the reid_store stays up to date.
+    if frame_count % FACE_UPDATE_EVERY == 0 or (recognized_owner_id is not None and frame_count % 15 == 0):
+        for pid, pdata in list(active_persons.items()):
+            emb = _try_extract_face_emb(frame, pdata["bbox"])
+            if emb is not None:
+                stable_id = pdata.get('stable_id')
+                if stable_id:
+                    reid_store.update_face(stable_id, emb)
+                else:
+                    rec = reid_store.find_match(emb, cosine_distance)
+                    if rec is None:
+                        rec = reid_store.register(emb, is_owner=(pid == recognized_owner_id))
+                    elif pid == recognized_owner_id:
+                        reid_store.mark_owner(rec["stable_id"])
+                    else:
+                        reid_store.touch(rec["stable_id"])
+                    pdata["stable_id"] = rec["stable_id"]
+                if pid == recognized_owner_id:
+                    print(f"[DEBUG] Refreshed owner face embedding (frame {frame_count})")
+
+    # Tick ReID store to age out stale lost records
+    reid_store.tick()
+
+    # Recover owner when currently unrecognised.
+    # FaceNet path runs freely (gated by owner_profile having a face_embedding).
+    # CLIP fallback inside recover_owner_by_profile() is rate-limited separately.
+    _should_recover = recognized_owner_id is None and active_persons
+    if _should_recover:
+        recovered_pid = recover_owner_by_profile(frame)
+        if recovered_pid is not None:
+            recognized_owner_id = recovered_pid
+            owner_lock_loss_count = 0
+            owner_prediction_streak = 0
+            owner_box = active_persons[recovered_pid]["bbox"]
+            update_owner_profile(frame, owner_box, pose_landmarks=threat_analyzer.get_pose_landmarks(recovered_pid))
+
+    # Owner recognition: search for owner's face inside each YOLO person box
+    # IMPROVED: Run more frequently (every 10 frames instead of 30) and also when owner confidence is low
+    owner_needs_check = (
+        recognized_owner_id is None or 
+        (recognized_owner_id is not None and active_persons.get(recognized_owner_id, {}).get("owner_distance", 999) > 0.5)
+    )
     if (
         OWNER_RECOGNITION_ENABLED
-        and recognized_owner_id is None
-        and frame_count % OWNER_RECOGNITION_EVERY == 0
+        and owner_needs_check
+        and frame_count % 10 == 0  # Run every 10 frames instead of 30
     ):
-        run_owner_recognition(frame)
+        run_owner_recognition_in_yolo_boxes(frame)
 
+    # Sync identity labels
+    # IMPROVED: Add temporal consistency to prevent rapid owner switching
+    effective_owner_id = recognized_owner_id if recognized_owner_id in active_persons else None
+    
+    # Track owner stability - don't switch owner too frequently
+    if effective_owner_id != recognized_owner_id:
+        if recognized_owner_id is not None:
+            # Owner was lost, require stronger evidence to reassign
+            owner_lock_loss_count += 1
+        else:
+            # No current owner, can assign more easily
+            pass
+    
     for pid in active_persons:
         if pid == recognized_owner_id:
             active_persons[pid]["identity"] = "owner"
@@ -768,9 +1267,51 @@ while True:
             active_persons[pid]["identity"] = "unknown"
             active_persons[pid]["owner_confirmed"] = False
 
-    effective_owner_id = recognized_owner_id if recognized_owner_id in active_persons else None
+    # If no persons are being tracked, show a minimal overlay and skip Phase 2
+    if not active_persons:
+        cv2.putText(frame, "No persons detected", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        cv2.imshow(WINDOW_NAME, cv2.resize(frame, (DISPLAY_W, DISPLAY_H)) if frame.shape[1] != DISPLAY_W or frame.shape[0] != DISPLAY_H else frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+        continue
 
-    # STEP 5: UPDATE OBJECTS
+    # =========================================================
+    # PHASE 2: FULL ANALYSIS (objects / weapons, threat scoring,
+    # behavior, drawing) — only reached when persons are present
+    # =========================================================
+
+    # --- Object / weapon detection from the same YOLO result ---
+    current_object_detections = []
+
+    for det in raw_detections:
+        x1, y1, x2, y2, conf, cls = det
+        cls = int(cls)
+        conf = float(conf)
+
+        class_name = class_id_to_name(cls)
+        if class_name is None or class_name == "person":
+            continue
+
+        box = [int(x1), int(y1), int(x2), int(y2)]
+
+        matched_id = match_detection_to_tracks(
+            box, active_objects, iou_threshold=0.20, dist_threshold=180
+        )
+
+        if matched_id is None:
+            if not should_accept_new(class_name, conf):
+                continue
+        else:
+            if not should_keep_existing(class_name, conf):
+                continue
+
+        current_object_detections.append({
+            "bbox": box,
+            "conf": conf,
+            "class_name": class_name,
+        })
+
+    # --- Update object tracks ---
     matched_object_ids = set()
 
     for det in current_object_detections:
@@ -779,10 +1320,7 @@ while True:
         candidate_class = det["class_name"]
 
         object_id = match_detection_to_tracks(
-            box,
-            active_objects,
-            iou_threshold=0.20,
-            dist_threshold=180
+            box, active_objects, iou_threshold=0.20, dist_threshold=180
         )
 
         if object_id is None:
@@ -795,7 +1333,7 @@ while True:
                 "class_name": candidate_class,
                 "missing": 0,
                 "seen_count": 1,
-                "confirmed": False
+                "confirmed": False,
             }
 
             object_class_history[object_id] = deque(maxlen=5)
@@ -842,10 +1380,32 @@ while True:
 
     threat_analyzer.cleanup_missing_tracks(active_persons.keys())
 
-    # STEP 6: GLOBAL WEAPON OWNERSHIP
+    # --- Obstacle Detection ---
+    obstacle, obstacle_area = obstacle_detector.get_nearest_obstacle(frame, raw_detections)
+
+    # --- Global weapon ownership ---
     weapon_assignments = assign_weapons_to_people(active_persons, active_objects)
 
-    # STEP 7: ANALYZE ALL PERSONS
+    # --- Draw pending (identifying) persons ---
+    # These are real detections that are still in the grace period; show a
+    # subtle gray box so the person is visible but not yet labelled.
+    _fH_draw, _fW_draw = frame.shape[:2]
+    for _pt_id, _pt in pending_tracks.items():
+        if _pt_id in active_persons:
+            continue
+        _px1, _py1, _px2, _py2 = [int(v) for v in _pt['bbox']]
+        _px1 = max(0, min(_px1, _fW_draw - 1))
+        _py1 = max(0, min(_py1, _fH_draw - 1))
+        _px2 = max(0, min(_px2, _fW_draw - 1))
+        _py2 = max(0, min(_py2, _fH_draw - 1))
+        if _px2 > _px1 and _py2 > _py1:
+            cv2.rectangle(frame, (_px1, _py1), (_px2, _py2), (160, 160, 160), 1)
+            elapsed = time.time() - _pt['first_seen']
+            dots = "." * (int(elapsed * 3) % 4 + 1)   # animated "..."
+            cv2.putText(frame, f"ID?{dots}", (_px1, max(14, _py1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1, cv2.LINE_AA)
+
+    # --- Analyze and draw all confirmed persons ---
     owner_bbox = active_persons[effective_owner_id]["bbox"] if effective_owner_id in active_persons else None
 
     for pid, person_data in active_persons.items():
@@ -858,11 +1418,34 @@ while True:
         is_real_owner = (pid == recognized_owner_id)
         identity = "owner" if is_real_owner else "unknown"
 
+        # Per-person pixel change: check if this person visibly moved since
+        # the last frame. If not, MediaPipe models will use cached results
+        # (no re-inference needed — saves significant CPU on RPi).
+        if len(pbox) != 4:
+            print(f"[ERROR] Invalid bbox for person {pid}: {pbox}")
+            continue
+        x1c, y1c, x2c, y2c = [int(v) for v in pbox]
+        fH, fW = frame.shape[:2]
+        x1c = max(0, min(x1c, fW - 1))
+        x2c = max(0, min(x2c, fW - 1))
+        y1c = max(0, min(y1c, fH - 1))
+        y2c = max(0, min(y2c, fH - 1))
+        person_moved = True
+        if x2c > x1c and y2c > y1c:
+            crop_gray = cv2.cvtColor(frame[y1c:y2c, x1c:x2c], cv2.COLOR_BGR2GRAY)
+            prev_crop  = person_prev_crops.get(pid)
+            if prev_crop is not None and prev_crop.shape == crop_gray.shape:
+                diff     = cv2.absdiff(crop_gray, prev_crop)
+                ch_ratio = np.count_nonzero(diff > 20) / max(1, diff.size)
+                person_moved = ch_ratio > PERSON_MOVEMENT_THRESHOLD
+            person_prev_crops[pid] = crop_gray
+        person_data["person_moved"] = person_moved
+
         person = {
             "id": pid,
             "bbox": pbox,
             "identity": identity,
-            "weapons": assigned_weapons
+            "weapons": assigned_weapons,
         }
 
         context = {
@@ -878,9 +1461,14 @@ while True:
             person,
             context,
             frame_index=frame_count,
+            person_moved=person_moved,
         )
 
-        x1, y1, x2, y2 = pbox
+        if len(pbox) != 4:
+            print(f"[ERROR] Invalid bbox for drawing person {pid}: {pbox}")
+            continue
+        x1, y1, x2, y2 = [int(v) for v in pbox]
+        print(f"[DEBUG] Drawing person {pid} with bbox: {pbox} → int: ({x1}, {y1}, {x2}, {y2})")
 
         if is_real_owner:
             color = (255, 255, 0)
@@ -893,20 +1481,9 @@ while True:
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if is_real_owner else 2)
 
-        if is_real_owner:
-            main_label = "OWNER"
-        else:
-            main_label = f"ID {pid} | {threat_level} {threat_score:.1f}"
-
-        cv2.putText(
-            frame,
-            main_label,
-            (x1, max(20, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2
-        )
+        display_id = person_data.get('stable_id') or pid
+        main_label = "OWNER" if is_real_owner else f"ID {display_id} | {threat_level} {threat_score:.1f}"
+        cv2.putText(frame, main_label, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
         info_lines = []
 
@@ -919,18 +1496,16 @@ while True:
             info_lines.append(f"behavior: {debug.get('behavior_score', 0.0):.1f}")
             info_lines.append(f"owner_prox: {debug.get('owner_proximity_score', 0.0):.1f}")
             info_lines.append(f"robot_dist: {debug.get('robot_distance_score', 0.0):.1f}")
-            info_lines.append(
-                f"mask: {debug.get('mask_label','?')} "
-                f"({debug.get('mask_conf', 0.0):.2f}) "
-                f"+{debug.get('mask_score', 0.0):.0f}pts"
-            )
 
         info_lines.append(f"person_conf: {person_data['conf']:.2f}")
         info_lines.append(f"source: {person_data.get('source', 'yolo')}")
+        if person_data.get("identifying", False):
+            info_lines.append("tracking: identifying")
 
-        owner_dist = person_data.get("owner_distance", 999.0)
-        streak = person_data.get("owner_match_streak", 0)
-        info_lines.append(f"owner_dist: {owner_dist:.3f} | streak: {streak}")
+        if person_data.get("owner_distance", 999.0) < 999.0:
+            info_lines.append(
+                f"owner_dist: {person_data['owner_distance']:.3f} | streak: {person_data.get('owner_match_streak', 0)}"
+            )
 
         if assigned_weapons:
             weapon_text = ", ".join(
@@ -947,7 +1522,7 @@ while True:
             fx1, fy1, fx2, fy2 = face_box
             cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (200, 200, 0), 1)
 
-    # STEP 8: DRAW OBJECTS
+    # --- Draw confirmed objects ---
     for oid, obj in active_objects.items():
         if not obj["confirmed"]:
             continue
@@ -956,31 +1531,32 @@ while True:
         label = f"{obj['class_name']} {obj['conf']:.2f}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(
-            frame,
-            label,
-            (x1, max(20, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 0, 0),
-            2
-        )
+        cv2.putText(frame, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-    summary_owner = "NONE"
-    if recognized_owner_id in active_persons:
-        summary_owner = f"OWNER ID {recognized_owner_id}"
+    # --- Enhanced visualization ---
+    dz_w = int(CAM_W * 0.5)
+    dz_h = int(CAM_H * 0.33)
+    dz_x1 = CAM_W // 2 - dz_w // 2
+    dz_y1 = CAM_H - dz_h - 10
+    danger_zone = (dz_x1, dz_y1, dz_x1 + dz_w, dz_y1 + dz_h)
 
+    # Draw confidence bar for owner if available
+    if recognized_owner_id is not None and recognized_owner_id in active_persons:
+        owner_conf = active_persons[recognized_owner_id]["conf"]
+        draw_confidence_bar(frame, owner_conf, x=10, y=60)
+
+    summary_owner = f"OWNER ID {recognized_owner_id}" if recognized_owner_id in active_persons else "NONE"
     cv2.putText(
         frame,
         f"Owner: {summary_owner}",
         (10, 25),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        0.45,
         (255, 255, 255),
-        2
+        1,
     )
 
-    cv2.imshow("Threat Detection Test", frame)
+    cv2.imshow(WINDOW_NAME, cv2.resize(frame, (DISPLAY_W, DISPLAY_H)) if frame.shape[1] != DISPLAY_W or frame.shape[0] != DISPLAY_H else frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == 27:

@@ -93,7 +93,7 @@ class BehaviorAnalyzer:
             should_run_pose = (frame_index - last_run) >= self.pose_every_n
 
         if not should_run_pose and track_id in self.pose_cache:
-            pose_score, pose_behaviors = self.pose_cache[track_id]
+            pose_score, pose_behaviors, pose_landmarks = self.pose_cache[track_id]
             score += pose_score
             behaviors.extend(pose_behaviors)
             return min(score, 10), behaviors
@@ -124,13 +124,20 @@ class BehaviorAnalyzer:
                 pose_score += 3
                 pose_behaviors.append("Running")
 
-        self.pose_cache[track_id] = (pose_score, pose_behaviors)
+        self.pose_cache[track_id] = (pose_score, pose_behaviors, landmarks if results.pose_landmarks else None)
         if frame_index is not None:
             self.pose_last_run[track_id] = frame_index
 
         score += pose_score
         behaviors.extend(pose_behaviors)
         return min(score, 10), behaviors
+
+    def get_pose_landmarks(self, track_id):
+        """Get the latest pose landmarks for a track_id if available"""
+        if track_id in self.pose_cache:
+            _, _, landmarks = self.pose_cache[track_id]
+            return landmarks
+        return None
 
     def _has_raised_arms(self, landmarks):
         return (
