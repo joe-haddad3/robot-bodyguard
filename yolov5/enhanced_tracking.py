@@ -99,6 +99,12 @@ class AdaptiveFingerprint:
         self.zone_hists = None   # list of 3 normalised HSV histograms
         self.needs_enhanced = False
 
+        # Multi-view snapshot gallery — stores up to 20 (base_hist, zone_hists)
+        # tuples captured at different times/angles while the owner is tracked.
+        # compare_best_snapshot() returns the best match across all of them,
+        # enabling re-ID even when the owner reappears from a different angle.
+        self.snapshot_hists = []
+
         # Update tracking
         self.update_counter = 0
         self.stable_frames = 0
@@ -274,6 +280,76 @@ class AdaptiveFingerprint:
 
         except Exception as e:
             print(f"Fingerprint compare error: {e}")
+            return 0.0
+
+    def add_snapshot(self, frame, box):
+        """Capture the owner's current appearance and add it to the multi-view
+        snapshot gallery.  Called every few frames while the owner is tracked so
+        the gallery accumulates front, side, and back-view samples.  Near-
+        duplicate frames (histogram correlation > 0.96) are skipped so each
+        entry represents a genuinely different appearance angle or pose."""
+        try:
+            x1, y1, x2, y2 = [int(v) for v in box]
+            h, w = frame.shape[:2]
+            x1, x2 = max(0, x1), min(w, x2)
+            y1, y2 = max(0, y1), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                return
+            roi = frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                return
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            base_hist = cv2.calcHist([hsv], [0, 1, 2], None,
+                                     [8, 8, 8], [0, 180, 0, 256, 0, 256])
+            base_hist = cv2.normalize(base_hist, base_hist).flatten().astype(np.float32)
+            zone_hists = self._compute_zone_hists(roi)
+            # Skip near-duplicate snapshots to keep the gallery diverse
+            for (existing_base, _) in self.snapshot_hists:
+                if float(cv2.compareHist(existing_base, base_hist, cv2.HISTCMP_CORREL)) > 0.96:
+                    return
+            self.snapshot_hists.append((base_hist, zone_hists))
+            if len(self.snapshot_hists) > 20:
+                self.snapshot_hists.pop(0)
+        except Exception as e:
+            print(f"Fingerprint add_snapshot error: {e}")
+
+    def compare_best_snapshot(self, frame, box):
+        """Compare the candidate crop against every stored snapshot and return
+        the BEST (highest) score.  This is the primary re-ID path when the owner
+        reappears from an angle that doesn't match the blended base histogram."""
+        if not self.snapshot_hists:
+            return 0.0
+        try:
+            x1, y1, x2, y2 = [int(v) for v in box]
+            h, w = frame.shape[:2]
+            x1, x2 = max(0, x1), min(w, x2)
+            y1, y2 = max(0, y1), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                return 0.0
+            roi = frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                return 0.0
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            cur_base = cv2.calcHist([hsv], [0, 1, 2], None,
+                                    [8, 8, 8], [0, 180, 0, 256, 0, 256])
+            cur_base = cv2.normalize(cur_base, cur_base).flatten().astype(np.float32)
+            cur_zones = self._compute_zone_hists(roi)
+            best = 0.0
+            for (snap_base, snap_zones) in self.snapshot_hists:
+                s_base = max(0.0, float(cv2.compareHist(snap_base, cur_base, cv2.HISTCMP_CORREL)))
+                if cur_zones is not None and snap_zones is not None:
+                    zone_weights = [0.25, 0.45, 0.30]
+                    s_zone = sum(
+                        wz * max(0.0, float(cv2.compareHist(sz, nz, cv2.HISTCMP_CORREL)))
+                        for sz, nz, wz in zip(snap_zones, cur_zones, zone_weights)
+                    )
+                    score = 0.5 * s_base + 0.5 * s_zone
+                else:
+                    score = s_base
+                best = max(best, score)
+            return float(best)
+        except Exception as e:
+            print(f"Fingerprint compare_best_snapshot error: {e}")
             return 0.0
 
     def _compute_enhanced_color_hist(self, hsv):
@@ -562,7 +638,7 @@ class BodyguardConfig:
         # Owner recognition
         self.owner_recognition_enabled = True
         self.owner_recognition_every = 2
-        self.owner_distance_threshold = 0.35  # slightly looser so angled/partial faces still match
+        self.owner_distance_threshold = 0.45  # live face ~2x enrolled dist; strangers ~0.55+
         self.owner_confirm_frames = 2          # 2 consecutive matches instead of 3 — faster lock-on
         self.owner_lost_frames_threshold = 5
         self.face_expand = 0.15               # larger padding around detected face crop
@@ -573,7 +649,7 @@ class BodyguardConfig:
         self.prediction_enabled = True
 
         # Performance settings
-        self.rpi_mode = True
+        self.rpi_mode = False
         if self.rpi_mode:
             self.camera_width = 320
             self.camera_height = 240

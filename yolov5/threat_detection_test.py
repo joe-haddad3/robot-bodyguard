@@ -230,6 +230,14 @@ owner_lock_loss_count = 0
 owner_profile = None
 owner_prediction_streak = 0  # Consecutive frames maintained by prediction
 
+# Recovery confirmation — require the same candidate to match N consecutive
+# frames before promoting them to recognized_owner_id.  Prevents a single
+# histogram or CLIP hit on a stranger's similar clothing from triggering a
+# false owner lock.
+RECOVERY_CONFIRM_FRAMES = 2
+_recovery_candidate_pid    = None
+_recovery_candidate_streak = 0
+
 # Dual recognizer strategy:
 #   owner_recognizer = FaceNet (primary, fast, face-based — always loaded)
 #   clip_recognizer  = CLIP    (fallback, slow, body-based — used only when
@@ -240,15 +248,15 @@ owner_prediction_streak = 0  # Consecutive frames maintained by prediction
 # Both can run together — whichever finds a confident match updates the streak.
 owner_recognizer = FaceNetOwnerRecognizer(threshold=OWNER_DISTANCE_THRESHOLD)
 
-clip_recognizer = None   # populated below if CLIP is installed + gallery exists
+clip_recognizer = None   # populated below if CLIP is installed
 try:
     _cr = CLIPOwnerRecognizer(threshold=0.82)
     if _cr.enabled:
+        clip_recognizer = _cr  # always assign — gallery populated live from owner tracking
         if _cr.get_gallery_size() > 0:
-            clip_recognizer = _cr
-            print(f"[INIT] CLIP fallback recognizer loaded ({clip_recognizer.get_gallery_size()} gallery items)")
+            print(f"[INIT] CLIP loaded ({clip_recognizer.get_gallery_size()} gallery items from previous session)")
         else:
-            print("[INIT] CLIP installed but gallery is empty — run enroll_owner_clip.py to enable back/side recognition")
+            print("[INIT] CLIP loaded (empty gallery — will auto-populate once owner is confirmed)")
     else:
         print("[INIT] CLIP not available (install: pip install git+https://github.com/openai/CLIP.git)")
 except Exception as e:
@@ -260,9 +268,9 @@ enhanced_tracker = EnhancedPersonTracker(config)
 # Ultralytics ByteTrack defaults, mirroring the official bytetrack.yaml config.
 BYTE_TRACKER_ARGS = SimpleNamespace(
     tracker_type="bytetrack",
-    track_high_thresh=0.25,
+    track_high_thresh=0.20,
     track_low_thresh=0.10,
-    new_track_thresh=0.25,
+    new_track_thresh=0.15,
     track_buffer=30 if not config.rpi_mode else 60,
     match_thresh=0.80,
     fuse_score=True,
@@ -691,7 +699,7 @@ def run_owner_recognition_in_yolo_boxes(frame):
 
         dist     = 999.0
         is_owner = False
-        face_found = False  # True when FaceNet managed to find a face in this crop
+        haar_face_found = False  # True only when Haar cascade detected a real face
 
         # ── FaceNet (primary) — works whenever the face is at least partially visible ──
         face_y2 = y1 + int((y2 - y1) * 0.55)
@@ -720,14 +728,15 @@ def run_owner_recognition_in_yolo_boxes(frame):
                         if face_crop_bgr.size > 0:
                             face_crop_rgb   = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                             face_box_global = (cx1 + fx1, cy1 + fy1, cx1 + fx2, cy1 + fy2)
+                            haar_face_found = True  # Haar found a real face
 
                 # Attempt 2: full upper crop as face input (angled / partial face)
                 if face_crop_rgb is None and min(person_crop.shape[:2]) >= MIN_OWNER_FACE_SIZE:
                     face_crop_rgb  = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
                     face_box_global = (cx1, cy1, cx2, cy2)
+                    # haar_face_found stays False — this is a fallback, not a real face detection
 
                 if face_crop_rgb is not None:
-                    face_found = True
                     pdata["face_box_global"] = face_box_global
 
                     face_emb = owner_recognizer.embed_face_rgb(face_crop_rgb)
@@ -739,17 +748,17 @@ def run_owner_recognition_in_yolo_boxes(frame):
                         1.0 - float(np.dot(face_emb, owner_recognizer.mean_embedding))
                         if owner_recognizer.mean_embedding is not None else 999.0
                     )
-                    sample_dists     = [1.0 - float(np.dot(face_emb, ref)) for ref in owner_recognizer.owner_embeddings]
-                    best_sample_dist = min(sample_dists) if sample_dists else 999.0
                     dist     = float(mean_dist)
-                    is_owner = dist < OWNER_DISTANCE_THRESHOLD and best_sample_dist < OWNER_DISTANCE_THRESHOLD
+                    is_owner = dist < OWNER_DISTANCE_THRESHOLD
                     if is_owner:
                         best_face_crop = face_crop_rgb
 
-        # ── CLIP (fallback) — kicks in when face is turned away / covered ──────
-        # Only runs when FaceNet found no usable face AND the CLIP gallery is ready
-        # AND this is a frame where CLIP inference is scheduled (rate-limited).
-        if not face_found and _clip_frame_ok:
+        # ── CLIP (fallback) — kicks in when Haar found no real face ──────────
+        # Gated on haar_face_found (not face_found) so CLIP actually runs when
+        # the person is facing away, covered, or at an angle where Haar misses.
+        # The old gate (not face_found) never fired because the upper-body fallback
+        # always set face_found=True, silently disabling CLIP.
+        if not haar_face_found and _clip_frame_ok:
             bx1 = max(0, x1); by1 = max(0, y1)
             bx2 = min(W, x2); by2 = min(H, y2)
             if bx2 > bx1 and by2 > by1:
@@ -877,7 +886,9 @@ def recover_owner_by_profile(frame):
 
     # ── CLIP fallback: gallery match on body crops when face not visible ───────
     # Rate-limited: CLIP is expensive on RPi CPU
-    if clip_recognizer is not None and clip_recognizer.owner_gallery and frame_count % CLIP_RECOGNITION_EVERY == 0:
+    # Run CLIP 4× more aggressively during recovery (owner is lost — urgency > CPU cost)
+    _recover_clip_every = max(3, CLIP_RECOGNITION_EVERY // 4)
+    if clip_recognizer is not None and clip_recognizer.owner_gallery and frame_count % _recover_clip_every == 0:
         for pid, pdata in active_persons.items():
             if pid == recognized_owner_id:
                 continue
@@ -910,7 +921,12 @@ def recover_owner_by_profile(frame):
                 x2 = min(W, x2); y2 = min(H, y2)
                 if x2 <= x1 or y2 <= y1:
                     continue
-                score = fp.compare(frame, [x1, y1, x2, y2], enhanced=fp.needs_enhanced)
+                box_candidate = [x1, y1, x2, y2]
+                # Primary: blended-histogram comparison (single view, fast)
+                score = fp.compare(frame, box_candidate, enhanced=fp.needs_enhanced)
+                # Multi-view: best match across all stored angle snapshots
+                snap_score = fp.compare_best_snapshot(frame, box_candidate)
+                score = max(score, snap_score)
                 if score > 0.72 and score > best_sim:
                     best_sim = score
                     best_pid = pid
@@ -1196,8 +1212,47 @@ while True:
         owner_box = active_persons[recognized_owner_id]["bbox"]
         update_owner_profile(frame, owner_box, pose_landmarks=threat_analyzer.get_pose_landmarks(recognized_owner_id))
 
+        # ── Fingerprint multi-view snapshot ───────────────────────────────────
+        # Every 2 frames while the owner is tracked, capture their full-body
+        # appearance into the snapshot gallery.  compare_best_snapshot() then
+        # matches against every stored view, so even a back-view or side-view
+        # re-entry can be identified without the face being visible.
+        if owner_profile is not None and frame_count % 2 == 0:
+            owner_profile["fingerprint"].add_snapshot(frame, owner_box)
+
+        # ── Live CLIP gallery snapshot ─────────────────────────────────────────
+        # While the owner is tracked, periodically add their full-body crop to
+        # the CLIP gallery so that CLIP can re-identify them on re-entry even
+        # when their face is not visible (back-to-camera, side view, covered).
+        # Without this the gallery stays empty and the CLIP recovery path never
+        # fires.  Cap the gallery size so it doesn't grow without bound.
+        _CLIP_GALLERY_UPDATE_EVERY = 10   # ~every 0.7 s at 15 fps
+        _CLIP_GALLERY_MAX_SIZE     = 24   # at most 24 snapshots in memory/on disk
+        if (clip_recognizer is not None
+                and frame_count % _CLIP_GALLERY_UPDATE_EVERY == 0
+                and clip_recognizer.get_gallery_size() < _CLIP_GALLERY_MAX_SIZE):
+            H_f, W_f = frame.shape[:2]
+            bx1 = max(0, int(owner_box[0])); by1 = max(0, int(owner_box[1]))
+            bx2 = min(W_f, int(owner_box[2])); by2 = min(H_f, int(owner_box[3]))
+            if bx2 > bx1 and by2 > by1:
+                _body_crop = frame[by1:by2, bx1:bx2]
+                if _body_crop.size > 0:
+                    _clip_emb = clip_recognizer.embed_image(_body_crop)
+                    if _clip_emb is not None:
+                        # Only add if sufficiently different from existing entries
+                        # (avoids storing near-duplicate frames)
+                        _is_novel = all(
+                            clip_cosine_similarity(_clip_emb, ref) < 0.97
+                            for ref in clip_recognizer.owner_gallery
+                        )
+                        if _is_novel or clip_recognizer.get_gallery_size() == 0:
+                            clip_recognizer.add_to_gallery(_clip_emb, label="live")
+
     # Every FACE_UPDATE_EVERY frames: try to extract / refresh face embeddings
     # for all active persons so the reid_store stays up to date.
+    # For the owner specifically, also keep owner_profile["face_embedding"] fresh
+    # so that recover_owner_by_profile can re-identify them by face if they
+    # disappear and reappear without showing their face again.
     if frame_count % FACE_UPDATE_EVERY == 0 or (recognized_owner_id is not None and frame_count % 15 == 0):
         for pid, pdata in list(active_persons.items()):
             emb = _try_extract_face_emb(frame, pdata["bbox"])
@@ -1214,8 +1269,8 @@ while True:
                     else:
                         reid_store.touch(rec["stable_id"])
                     pdata["stable_id"] = rec["stable_id"]
-                if pid == recognized_owner_id:
-                    print(f"[DEBUG] Refreshed owner face embedding (frame {frame_count})")
+                if pid == recognized_owner_id and owner_profile is not None:
+                    owner_profile["face_embedding"] = emb
 
     # Tick ReID store to age out stale lost records
     reid_store.tick()
@@ -1223,15 +1278,36 @@ while True:
     # Recover owner when currently unrecognised.
     # FaceNet path runs freely (gated by owner_profile having a face_embedding).
     # CLIP fallback inside recover_owner_by_profile() is rate-limited separately.
+    # A confirmation streak of RECOVERY_CONFIRM_FRAMES is required before the
+    # candidate is promoted — prevents a single histogram/CLIP hit on a stranger
+    # with similar clothing from triggering a false owner lock.
     _should_recover = recognized_owner_id is None and active_persons
     if _should_recover:
         recovered_pid = recover_owner_by_profile(frame)
         if recovered_pid is not None:
-            recognized_owner_id = recovered_pid
-            owner_lock_loss_count = 0
-            owner_prediction_streak = 0
-            owner_box = active_persons[recovered_pid]["bbox"]
-            update_owner_profile(frame, owner_box, pose_landmarks=threat_analyzer.get_pose_landmarks(recovered_pid))
+            if recovered_pid == _recovery_candidate_pid:
+                _recovery_candidate_streak += 1
+            else:
+                _recovery_candidate_pid    = recovered_pid
+                _recovery_candidate_streak = 1
+
+            if _recovery_candidate_streak >= RECOVERY_CONFIRM_FRAMES:
+                recognized_owner_id        = _recovery_candidate_pid
+                _recovery_candidate_pid    = None
+                _recovery_candidate_streak = 0
+                owner_lock_loss_count      = 0
+                owner_prediction_streak    = 0
+                owner_box = active_persons[recognized_owner_id]["bbox"]
+                update_owner_profile(frame, owner_box, pose_landmarks=threat_analyzer.get_pose_landmarks(recognized_owner_id))
+        else:
+            # No match this frame — decay streak so a single missed frame doesn't
+            # reset a near-confirmed candidate, but a sustained absence does.
+            _recovery_candidate_streak = max(0, _recovery_candidate_streak - 1)
+            if _recovery_candidate_streak == 0:
+                _recovery_candidate_pid = None
+    else:
+        _recovery_candidate_pid    = None
+        _recovery_candidate_streak = 0
 
     # Owner recognition: search for owner's face inside each YOLO person box
     # IMPROVED: Run more frequently (every 10 frames instead of 30) and also when owner confidence is low
