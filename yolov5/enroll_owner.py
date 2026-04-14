@@ -1,20 +1,22 @@
 """
-Run this script ONCE to enroll the owner's face.
-It opens the camera, captures face samples using MTCNN (face alignment),
-and saves face_db/owner_embeddings.npy for FaceNetOwnerRecognizer.
+Enroll the owner's face into the recognition database.
 
-Usage:
-    python enroll_owner.py
+Two modes:
 
-Controls:
-    SPACE  - capture a sample (aim for 30-50 samples, vary your head angle)
-    S      - save and exit
-    ESC    - exit without saving
+  1. Live camera (default):
+       python enroll_owner.py
+     SPACE = capture sample, S = save & exit, ESC = cancel
+
+  2. From saved photos (recommended — run capture_enrollment_photos.py first):
+       python enroll_owner.py --from-photos
+     Reads every image in face_db/enrollment_photos/, extracts embeddings,
+     and saves them. No camera needed.
 
 Tips for best recognition:
-    - Capture from multiple angles (left, right, up, down, straight)
-    - Vary lighting if possible
-    - Aim for 40+ samples
+    - Aim for 60+ samples across many angles (left, right, up, down, straight, 45°)
+    - Vary lighting: indoor overhead, near a window, dim room
+    - With and without glasses if applicable
+    - The --from-photos workflow lets you review photos before committing
 """
 
 import os
@@ -25,10 +27,11 @@ from PIL import Image
 import torch
 from facenet_pytorch import InceptionResnetV1, MTCNN
 
-SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_db")
-SAVE_PATH = os.path.join(SAVE_DIR, "owner_embeddings.npy")
-CAMERA_INDEX = 0
-TARGET_SAMPLES = 40
+SAVE_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_db")
+SAVE_PATH   = os.path.join(SAVE_DIR, "owner_embeddings.npy")
+PHOTOS_DIR  = os.path.join(SAVE_DIR, "enrollment_photos")
+CAMERA_INDEX  = 0
+TARGET_SAMPLES = 60
 
 
 def l2_normalize(v):
@@ -36,7 +39,64 @@ def l2_normalize(v):
     return v / n if n > 1e-10 else v
 
 
+def save_embeddings(embeddings):
+    if len(embeddings) == 0:
+        print("[enroll_owner] No embeddings to save.")
+        return
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    arr = np.array(embeddings)
+    np.save(SAVE_PATH, arr)
+    print(f"\n[enroll_owner] Saved {len(arr)} embeddings → {SAVE_PATH}")
+    mean_raw  = arr.mean(axis=0)
+    mean_norm = mean_raw / (np.linalg.norm(mean_raw) + 1e-10)
+    mean_path = os.path.join(SAVE_DIR, "owner_mean_embedding.npy")
+    np.save(mean_path, mean_norm)
+    print(f"[enroll_owner] Saved mean embedding → {mean_path}")
+    # Delete cached ONNX so it is re-exported from fresh weights on next run
+    onnx_path = os.path.join(SAVE_DIR, "facenet.onnx")
+    if os.path.exists(onnx_path):
+        os.remove(onnx_path)
+        print(f"[enroll_owner] Deleted stale ONNX cache → will re-export on next run")
+
+
+def enroll_from_photos(mtcnn, model):
+    """Batch-enroll from images in face_db/enrollment_photos/."""
+    if not os.path.isdir(PHOTOS_DIR):
+        print(f"[ERROR] Photos folder not found: {PHOTOS_DIR}")
+        print("  Run capture_enrollment_photos.py first.")
+        sys.exit(1)
+
+    files = sorted([
+        f for f in os.listdir(PHOTOS_DIR)
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    ])
+    if not files:
+        print(f"[ERROR] No images found in {PHOTOS_DIR}")
+        sys.exit(1)
+
+    print(f"[enroll_owner] Processing {len(files)} photos from {PHOTOS_DIR} ...")
+    embeddings = []
+    skipped    = 0
+
+    for fname in files:
+        path = os.path.join(PHOTOS_DIR, fname)
+        img  = Image.open(path).convert("RGB")
+        face_tensor = mtcnn(img)
+        if face_tensor is None:
+            skipped += 1
+            continue
+        with torch.no_grad():
+            emb = model(face_tensor.unsqueeze(0)).cpu().numpy()[0]
+        embeddings.append(l2_normalize(emb))
+
+    print(f"[enroll_owner] Embedded {len(embeddings)} / {len(files)} photos "
+          f"({skipped} skipped — no face detected)")
+    save_embeddings(embeddings)
+
+
 def main():
+    from_photos = "--from-photos" in sys.argv
+
     print("[enroll_owner] Loading MTCNN + FaceNet models...")
 
     # MTCNN aligns faces to standard eye positions before embedding.
@@ -51,6 +111,10 @@ def main():
         device="cpu",
     )
     model = InceptionResnetV1(pretrained="vggface2").eval()
+
+    if from_photos:
+        enroll_from_photos(mtcnn, model)
+        return
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -70,7 +134,6 @@ def main():
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(frame_rgb)
 
-        # Detect face bounding boxes for display
         boxes, probs = mtcnn.detect(pil_img)
 
         display = frame.copy()
@@ -108,27 +171,16 @@ def main():
             if len(embeddings) == 0:
                 print("[WARN] No samples captured yet.")
             else:
-                os.makedirs(SAVE_DIR, exist_ok=True)
-                arr = np.array(embeddings)
-                np.save(SAVE_PATH, arr)
-                print(f"\n[enroll_owner] Saved {len(arr)} embeddings to {SAVE_PATH}")
-
-                mean_raw = arr.mean(axis=0)
-                mean_norm = mean_raw / (np.linalg.norm(mean_raw) + 1e-10)
-                mean_path = os.path.join(SAVE_DIR, "owner_mean_embedding.npy")
-                np.save(mean_path, mean_norm)
-                print(f"[enroll_owner] Saved mean embedding to {mean_path}")
+                save_embeddings(embeddings)
             break
 
         elif key == ord(" "):
-            # Get MTCNN-aligned face tensor
             face_tensor = mtcnn(pil_img)
 
             if face_tensor is None:
                 print("[WARN] No face detected — move closer or improve lighting.")
                 continue
 
-            # face_tensor: (3, 160, 160) — already aligned and normalized
             with torch.no_grad():
                 emb = model(face_tensor.unsqueeze(0)).cpu().numpy()[0]
 
@@ -136,7 +188,6 @@ def main():
             embeddings.append(emb)
             print(f"[OK] Captured sample {len(embeddings)}")
 
-            # Flash green to confirm capture
             flash = display.copy()
             cv2.rectangle(flash, (0, 0), (frame.shape[1], frame.shape[0]), (0, 255, 0), 8)
             cv2.imshow("Enroll Owner", flash)
