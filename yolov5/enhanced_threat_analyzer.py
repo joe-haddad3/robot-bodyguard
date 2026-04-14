@@ -95,6 +95,31 @@ class EnhancedThreatAnalyzer:
     def _distance(self, a, b):
         return float(np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2))
 
+    def _point_near_bbox(self, point, bbox, margin=35):
+        x, y = point
+        x1, y1, x2, y2 = bbox
+        return (x1 - margin) <= x <= (x2 + margin) and (y1 - margin) <= y <= (y2 + margin)
+
+    def _landmark_to_global(self, landmark, person_bbox):
+        x1, y1, x2, y2 = person_bbox
+        w = max(1.0, float(x2 - x1))
+        h = max(1.0, float(y2 - y1))
+        return (float(x1) + landmark.x * w, float(y1) + landmark.y * h)
+
+    def _is_attacking_owner(self, person_bbox, owner_bbox, pose_landmarks):
+        if owner_bbox is None or not pose_landmarks:
+            return False
+
+        # Wrists entering the owner's space ~= swing / strike.
+        # Ankles entering the owner's space ~= kick.
+        for idx in (15, 16, 27, 28):
+            if idx >= len(pose_landmarks):
+                continue
+            point = self._landmark_to_global(pose_landmarks[idx], person_bbox)
+            if self._point_near_bbox(point, owner_bbox, margin=35):
+                return True
+        return False
+
     # ------------------------------------------------------------------
     # Track lifecycle
     # ------------------------------------------------------------------
@@ -120,43 +145,57 @@ class EnhancedThreatAnalyzer:
 
     def analyze_person(self, frame, person, context, frame_index=None, person_moved=True):
         """
-        Compute threat level for one person.
+        Compute threat level for one person using a strict ruleset:
+
+        1. Unknown + weapon + close to owner => THREAT
+        2. Unknown + weapon + far from owner => SUSPICIOUS
+        3. Unknown + angry => SUSPICIOUS
+        4. Unknown swings at / kicks owner => THREAT
 
         Returns:
             (level, avg_score, explanation, debug)
             level: "SAFE" | "SUSPICIOUS" | "THREAT"
         """
         try:
-            score       = 0.0
             explanation = []
-            debug       = {}
+            debug = {
+                "identity_score": 0.0,
+                "weapon_score": 0.0,
+                "aggression_score": 0.0,
+                "aggression_points": 0.0,
+                "behavior_score": 0.0,
+                "robot_distance_score": 0.0,
+                "owner_proximity_score": 0.0,
+                "has_weapon": False,
+                "close_to_owner": False,
+                "angry": False,
+                "attacking_owner": False,
+            }
 
             track_id = person["id"]
             identity = person.get("identity", "unknown")
             bbox     = person["bbox"]
 
-            # ---- IDENTITY ----
-            identity_score = float(self.IDENTITY_WEIGHTS.get(identity, 3))
-            score += identity_score
-            debug["identity_score"] = identity_score
-
-            # Owner short-circuits immediately — no further analysis needed
+            # Owner short-circuits immediately.
             if identity == "owner":
                 explanation.append("OWNER")
-                return "SAFE", score, explanation, debug
+                return "SAFE", 0.0, explanation, debug
 
-            # ---- WEAPON SCORE ----
-            weapon_score = 0.0
+            # ---- WEAPON PRESENCE ----
+            has_weapon = False
+            strongest_weapon = None
             for w in person.get("weapons", []):
                 cls  = w["class_name"]
                 conf = float(w["conf"])
                 if cls in self.WEAPON_WEIGHTS and conf >= self.WEAPON_THRESHOLDS.get(cls, 0.50):
-                    weapon_score += float(self.WEAPON_WEIGHTS[cls])
+                    has_weapon = True
+                    strongest_weapon = cls
+                    break
 
-            score += weapon_score
-            debug["weapon_score"] = weapon_score
+            debug["has_weapon"] = has_weapon
+            debug["weapon_score"] = 1.0 if has_weapon else 0.0
 
-            # ---- AGGRESSION SCORE (rate-limited, per-person instance) ----
+            # ---- FACE / AGGRESSION CACHE ----
             x1, y1, x2, y2 = [int(v) for v in bbox]
             fh, fw = frame.shape[:2]
             x1 = max(0, min(x1, fw - 1))
@@ -164,8 +203,8 @@ class EnhancedThreatAnalyzer:
             y1 = max(0, min(y1, fh - 1))
             y2 = max(0, min(y2, fh - 1))
 
-            aggression_score  = 0.0
-            aggression_points = 0.0
+            aggression_score = 0.0
+            face_score = 0.0
 
             if x2 > x1 and y2 > y1:
                 has_cache  = track_id in self.aggression_cache
@@ -187,86 +226,59 @@ class EnhancedThreatAnalyzer:
                             self.aggression_last_run[track_id] = frame_index
 
                 cached = self.aggression_cache.get(track_id, {})
-                aggression_score  = float(cached.get("aggression_score", 0.0))
-                aggression_points = aggression_score * 20.0
-                score += aggression_points
+                aggression_score = float(cached.get("aggression_score", 0.0))
+                face_score = float(cached.get("face_score", 0.0))
 
-            debug["aggression_score"]  = aggression_score
-            debug["aggression_points"] = aggression_points
+            debug["aggression_score"] = aggression_score
 
-            # ---- BEHAVIOR SCORE (pose — BehaviorAnalyzer owns this) ----
+            # "angry" should come from the face/anger signal, not the old weighted score.
+            angry = face_score >= 0.22
+            debug["angry"] = angry
+
+            # ---- POSE / ATTACK CHECK ----
             run_pose = True
             if frame_index is not None:
                 run_pose = (frame_index % 4 == 0)
 
-            behavior_score, behaviors = self.behavior_analyzer.analyze_person(
+            _behavior_score, _behaviors = self.behavior_analyzer.analyze_person(
                 frame,
                 bbox,
                 track_id,
                 frame_index=frame_index,
                 run_pose=run_pose,
             )
-            behavior_score = float(behavior_score)
-            score += behavior_score
-            debug["behavior_score"] = behavior_score
-            explanation.extend(behaviors)
-
-            # ---- DISTANCE TO ROBOT ----
-            bbox_height       = bbox[3] - bbox[1]
-            robot_dist_score  = 0.0
-
-            if bbox_height > 400:
-                robot_dist_score = 5.0
-            elif bbox_height > 300:
-                robot_dist_score = 3.0
-            elif bbox_height > 200:
-                robot_dist_score = 1.0
-
-            score += robot_dist_score
-            debug["robot_distance_score"] = robot_dist_score
-
-            # ---- OWNER PROXIMITY ----
-            owner_bbox            = context.get("owner_bbox", None)
-            owner_proximity_score = 0.0
-
+            owner_bbox = context.get("owner_bbox", None)
+            close_to_owner = False
             if owner_bbox is not None:
                 person_center = self._bbox_center(bbox)
-                owner_center  = self._bbox_center(owner_bbox)
-                dist          = self._distance(person_center, owner_center)
-
-                if dist < 120:
-                    owner_proximity_score = 10.0
-                elif dist < 220:
-                    owner_proximity_score = 6.0
-                elif dist < 320:
-                    owner_proximity_score = 3.0
-
-                self.owner_distance_history[track_id].append(dist)
+                owner_center = self._bbox_center(owner_bbox)
+                owner_dist = self._distance(person_center, owner_center)
+                self.owner_distance_history[track_id].append(owner_dist)
                 self.owner_distance_history[track_id] = self.owner_distance_history[track_id][-5:]
+                close_to_owner = owner_dist < 220.0
+            debug["close_to_owner"] = close_to_owner
+            debug["owner_proximity_score"] = 1.0 if close_to_owner else 0.0
 
-                hist = self.owner_distance_history[track_id]
-                if len(hist) >= 3:
-                    if hist[0] - hist[-1] > 120:
-                        owner_proximity_score += 8.0
-                    elif hist[0] - hist[-1] > 60:
-                        owner_proximity_score += 4.0
+            pose_landmarks = self.behavior_analyzer.get_pose_landmarks(track_id)
+            attacking_owner = self._is_attacking_owner(bbox, owner_bbox, pose_landmarks)
+            debug["attacking_owner"] = attacking_owner
 
-            score += owner_proximity_score
-            debug["owner_proximity_score"] = owner_proximity_score
+            if attacking_owner:
+                explanation.append("ATTACKING_OWNER")
+                return "THREAT", 100.0, explanation, debug
 
-            # ---- FINAL SMOOTHING (last 10 frames) ----
-            self.threat_history[track_id].append(score)
-            self.threat_history[track_id] = self.threat_history[track_id][-10:]
-            avg_score = float(np.mean(self.threat_history[track_id]))
+            if has_weapon:
+                if close_to_owner:
+                    explanation.append(f"ARMED_NEAR_OWNER:{strongest_weapon}")
+                    return "THREAT", 90.0, explanation, debug
+                explanation.append(f"ARMED_UNKNOWN:{strongest_weapon}")
+                return "SUSPICIOUS", 60.0, explanation, debug
 
-            if avg_score >= self.THREAT_THRESHOLD:
-                level = "THREAT"
-            elif avg_score >= self.SUSPICIOUS_THRESHOLD:
-                level = "SUSPICIOUS"
-            else:
-                level = "SAFE"
+            if angry:
+                explanation.append("ANGRY_UNKNOWN")
+                return "SUSPICIOUS", 40.0, explanation, debug
 
-            return level, avg_score, explanation, debug
+            return "SAFE", 0.0, explanation, debug
 
         except Exception as e:
             print(f"[EnhancedThreatAnalyzer] Error in analyze_person: {e}")
@@ -275,4 +287,3 @@ class EnhancedThreatAnalyzer:
     def get_pose_landmarks(self, track_id):
         """Get pose landmarks for a track_id from the behavior analyzer"""
         return self.behavior_analyzer.get_pose_landmarks(track_id)
-
