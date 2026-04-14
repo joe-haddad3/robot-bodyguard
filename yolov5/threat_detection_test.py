@@ -1487,7 +1487,11 @@ while True:
 
         if not is_real_owner:
             info_lines.append(f"threat: {threat_score:.1f} | {', '.join(explanation)}")
-            info_lines.append(f"aggr: {debug.get('aggression_score', 0.0):.2f} | weapon: {'yes' if debug.get('has_weapon') else 'no'}")
+            info_lines.append(
+                f"aggr: {debug.get('aggression_score', 0.0):.2f} | "
+                f"hand: {debug.get('hand_movement_score', 0.0):.2f} | "
+                f"weapon: {'yes' if debug.get('has_weapon') else 'no'}"
+            )
             info_lines.append(f"face: {mask_result.get('label', 'UNKNOWN')}")
 
         info_lines.append(f"person_conf: {person_data['conf']:.2f}")

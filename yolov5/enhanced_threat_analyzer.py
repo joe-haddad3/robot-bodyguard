@@ -111,19 +111,19 @@ class EnhancedThreatAnalyzer:
         h = max(1.0, float(y2 - y1))
         return (float(x1) + landmark.x * w, float(y1) + landmark.y * h)
 
-    def _is_attacking_owner(self, person_bbox, owner_bbox, pose_landmarks):
-        if owner_bbox is None or not pose_landmarks:
-            return False
+    def _owner_face_box(self, owner_bbox):
+        """Approximate the owner's face zone using the upper-center part of the box."""
+        if owner_bbox is None:
+            return None
+        x1, y1, x2, y2 = [float(v) for v in owner_bbox]
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
 
-        # Wrists entering the owner's space ~= swing / strike.
-        # Ankles entering the owner's space ~= kick.
-        for idx in (15, 16, 27, 28):
-            if idx >= len(pose_landmarks):
-                continue
-            point = self._landmark_to_global(pose_landmarks[idx], person_bbox)
-            if self._point_near_bbox(point, owner_bbox, margin=35):
-                return True
-        return False
+        face_x1 = x1 + 0.20 * w
+        face_x2 = x2 - 0.20 * w
+        face_y1 = y1
+        face_y2 = y1 + 0.38 * h
+        return (face_x1, face_y1, face_x2, face_y2)
 
     # ------------------------------------------------------------------
     # Track lifecycle
@@ -221,24 +221,36 @@ class EnhancedThreatAnalyzer:
                 return True
         return False
 
-    def _detect_swing_toward_owner(self, track_id, person_bbox, owner_bbox, pose_landmarks,
-                                    proximity_px=200):
+    def _detect_swing_toward_owner(
+        self,
+        track_id,
+        person_bbox,
+        owner_bbox,
+        pose_landmarks,
+        hand_movement_score=0.0,
+        proximity_px=160,
+        min_speed_px=30.0,
+        min_direction_cos=0.75,
+        min_hand_movement=0.25,
+    ):
         """
-        Detect a swinging motion directed at the owner.
+        Detect a hand swing directed at the owner's face.
 
         Three conditions must all be true:
-          1. Wrist speed >= 25 px over 2 frames (fast movement).
-          2. Movement direction has cosine similarity >= 0.6 toward owner centre.
-          3. Wrist is already within proximity_px of the owner box edge (so a swing
-             from across the room does not count — the hand must be near the owner).
+          1. AggressionAnalyzer reports real hand movement.
+          2. Wrist speed over 2 frames is high and directed toward the owner's face.
+          3. The wrist enters the owner's face zone, not just the general body box.
 
         Wrist positions accumulate in wrist_history every call.
         """
         if owner_bbox is None or not pose_landmarks or len(pose_landmarks) < 17:
             return False
+        if hand_movement_score < min_hand_movement:
+            return False
 
-        owner_cx = (owner_bbox[0] + owner_bbox[2]) / 2.0
-        owner_cy = (owner_bbox[1] + owner_bbox[3]) / 2.0
+        owner_face_box = self._owner_face_box(owner_bbox)
+        owner_cx = (owner_face_box[0] + owner_face_box[2]) / 2.0
+        owner_cy = (owner_face_box[1] + owner_face_box[3]) / 2.0
 
         hist = self.wrist_history[track_id]
         for side, idx in (("left", 15), ("right", 16)):
@@ -251,20 +263,28 @@ class EnhancedThreatAnalyzer:
             if len(positions) < 3:
                 continue
 
-            # Condition 3: wrist must be near the owner box already
+            # Wrist must be close enough to the owner's upper body before we even
+            # consider it an attack. This avoids swings from across the room.
             # Use a synthetic 1-px box around the wrist to reuse _box_to_box_distance
             wrist_box = (gx, gy, gx + 1, gy + 1)
             if self._box_to_box_distance(wrist_box, owner_bbox) > proximity_px:
                 continue
 
-            # Condition 1: fast displacement over 2 frames
+            # Require that the wrist is entering the owner's face zone now.
+            prev_x, prev_y = positions[-2]
+            was_in_face = self._point_near_bbox((prev_x, prev_y), owner_face_box, margin=10)
+            is_in_face = self._point_near_bbox((gx, gy), owner_face_box, margin=12)
+            if not is_in_face or was_in_face:
+                continue
+
+            # Fast displacement over 2 frames.
             dx = positions[-1][0] - positions[-3][0]
             dy = positions[-1][1] - positions[-3][1]
             speed = math.sqrt(dx * dx + dy * dy)
-            if speed < 25.0:
+            if speed < min_speed_px:
                 continue
 
-            # Condition 2: direction toward owner centre
+            # Movement direction must point toward the owner's face center.
             to_ox = owner_cx - positions[-1][0]
             to_oy = owner_cy - positions[-1][1]
             dist_to_owner = math.sqrt(to_ox * to_ox + to_oy * to_oy)
@@ -272,7 +292,7 @@ class EnhancedThreatAnalyzer:
                 continue
 
             cos_sim = (dx * to_ox + dy * to_oy) / (speed * dist_to_owner)
-            if cos_sim >= 0.6:
+            if cos_sim >= min_direction_cos:
                 return True
 
         return False
@@ -285,8 +305,7 @@ class EnhancedThreatAnalyzer:
         """
         Threat ruleset (aggression is pre-computed by update_aggression()):
 
-        1. Physical attack: wrist/ankle enters owner space           → THREAT
-        2. Swinging motion directed at owner                         → THREAT
+        1. Fast hand swing enters the owner's face zone              → THREAT
         3. Weapon box within 150 px of owner box                     → THREAT
         4. Weapon held but not yet near owner                        → SUSPICIOUS
         5. Angry face (no weapon)                                    → SUSPICIOUS
@@ -318,6 +337,7 @@ class EnhancedThreatAnalyzer:
             cached           = self.aggression_cache.get(track_id, {})
             aggression_score = float(cached.get("aggression_score", 0.0))
             face_score       = float(cached.get("face_score", 0.0))
+            hand_movement_score = float(cached.get("debug", {}).get("hand_movement_score", 0.0))
             angry            = face_score >= 0.22
 
             # ── Pose analysis (rate-gated) ────────────────────────────────────
@@ -336,38 +356,65 @@ class EnhancedThreatAnalyzer:
             #
             # 1. Swing detected: fast wrist movement directed at owner while
             #    already within 200 px of the owner box.
-            if self._detect_swing_toward_owner(track_id, bbox, owner_bbox, pose_landmarks):
+            if self._detect_swing_toward_owner(
+                track_id,
+                bbox,
+                owner_bbox,
+                pose_landmarks,
+                hand_movement_score=hand_movement_score,
+            ):
                 return "THREAT", 90.0, ["SWINGING_AT_OWNER"], {
-                    "aggression_score": aggression_score, "has_weapon": has_weapon}
+                    "aggression_score": aggression_score,
+                    "hand_movement_score": hand_movement_score,
+                    "has_weapon": has_weapon,
+                }
 
             # 2. Weapon box overlaps the owner box (weapon is at the owner).
             if has_weapon and self._weapon_inside_owner(weapons, owner_bbox):
                 return "THREAT", 85.0, [f"WEAPON_AT_OWNER:{strongest_weapon}"], {
-                    "aggression_score": aggression_score, "has_weapon": True}
+                    "aggression_score": aggression_score,
+                    "hand_movement_score": hand_movement_score,
+                    "has_weapon": True,
+                }
 
             # 3. Angry + weapon near owner → escalate to THREAT.
             if angry and has_weapon and self._weapon_near_owner(weapons, owner_bbox, threshold_px=150):
                 return "THREAT", 80.0, [f"ANGRY_ARMED_NEAR_OWNER:{strongest_weapon}"], {
-                    "aggression_score": aggression_score, "has_weapon": True}
+                    "aggression_score": aggression_score,
+                    "hand_movement_score": hand_movement_score,
+                    "has_weapon": True,
+                }
 
             # 4. Weapon held close to owner (within 150 px edge-to-edge) but
             #    not yet overlapping and not angry — approaching but not confirmed hostile.
             if has_weapon and self._weapon_near_owner(weapons, owner_bbox, threshold_px=150):
                 return "SUSPICIOUS", 65.0, [f"ARMED_NEAR_OWNER:{strongest_weapon}"], {
-                    "aggression_score": aggression_score, "has_weapon": True}
+                    "aggression_score": aggression_score,
+                    "hand_movement_score": hand_movement_score,
+                    "has_weapon": True,
+                }
 
             # 5. Weapon present but far from owner.
             if has_weapon:
                 return "SUSPICIOUS", 55.0, [f"ARMED_UNKNOWN:{strongest_weapon}"], {
-                    "aggression_score": aggression_score, "has_weapon": True}
+                    "aggression_score": aggression_score,
+                    "hand_movement_score": hand_movement_score,
+                    "has_weapon": True,
+                }
 
             # 6. Angry face with no weapon.
             if angry:
                 return "SUSPICIOUS", 40.0, ["ANGRY_UNKNOWN"], {
-                    "aggression_score": aggression_score, "has_weapon": False}
+                    "aggression_score": aggression_score,
+                    "hand_movement_score": hand_movement_score,
+                    "has_weapon": False,
+                }
 
             return "SAFE", 0.0, ["SAFE"], {
-                "aggression_score": aggression_score, "has_weapon": False}
+                "aggression_score": aggression_score,
+                "hand_movement_score": hand_movement_score,
+                "has_weapon": False,
+            }
 
         except Exception as e:
             print(f"[EnhancedThreatAnalyzer] analyze_person error: {e}")
