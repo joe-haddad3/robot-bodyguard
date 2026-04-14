@@ -41,7 +41,7 @@ CAM_FPS = config.camera_fps
 YOLO_EVERY = config.yolo_every_n_frames if config.rpi_mode else 1
 
 # Camera settings
-CAMERA_INDEX = 0  # Default camera index
+CAMERA_INDEX = 0 # Default camera index
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 
@@ -64,8 +64,6 @@ model = torch.hub.load(
 # boxes during second-stage association, which is the core of why ByteTrack
 # survives blur, partial turns, and brief occlusion better than a naive tracker.
 model.conf = 0.10
-                    
-
 
 # -----------------------------
 # ASYNC YOLO RUNNER
@@ -141,8 +139,13 @@ WEAPON_CLASSES = {"knife", "gun", "baseball_bat", "hammer"}
 ENTRY_THRESHOLDS = config.entry_thresholds
 KEEP_THRESHOLDS = config.keep_thresholds
 
-PERSON_MISSING_FRAMES = config.person_missing_frames
+# Keep wrong boxes from lingering on screen. Normal non-owner person tracks get
+# only a tiny prediction grace, while the owner keeps a slightly longer one.
 OBJECT_MISSING_FRAMES = config.object_missing_frames
+NON_OWNER_PREDICTION_FRAMES = 2
+OWNER_PREDICTION_FRAMES = 6
+MIN_SEEN_FRAMES_FOR_PREDICTION = 3
+OBJECT_MISSING_FRAMES = min(OBJECT_MISSING_FRAMES, 2)
 
 CLASS_CONFIRM_FRAMES = {
     "person": 1,
@@ -262,10 +265,6 @@ face_cascade = cv2.CascadeClassifier(
 )
 
 # MTCNN — used only in the owner recognition path so embeddings match enrollment.
-# Enrollment (enroll_owner.py) uses MTCNN-aligned 160×160 crops; running Haar at
-# inference time produces differently-cropped inputs that shift embeddings and hurt accuracy.
-# MTCNN is slower than Haar but only runs on person crops (not full frame) and only
-# every OWNER_RECOGNITION_EVERY frames, so the cost is acceptable on a PC.
 try:
     from facenet_pytorch import MTCNN as _MTCNN
     _mtcnn_recognizer = _MTCNN(
@@ -274,13 +273,17 @@ try:
         keep_all=False,
         min_face_size=MIN_OWNER_FACE_SIZE,
         thresholds=[0.6, 0.7, 0.7],
-        post_process=False,   # we want the raw tensor, normalisation done by FaceNet
+        post_process=False,
         device="cpu",
     )
     print("[INIT] MTCNN loaded — owner recognition will use aligned face crops (matches enrollment)")
 except Exception as _e:
     _mtcnn_recognizer = None
     print(f"[INIT] MTCNN unavailable ({_e}) — falling back to Haar for face crops")
+
+# Mask / face-concealment detector
+from mask_detector import MaskDetector
+mask_detector = MaskDetector()
 
 frame_count = 0
 raw_detections = []
@@ -634,30 +637,46 @@ def _try_extract_face_emb(frame, box):
     x1, y1, x2, y2 = (int(v) for v in box)
     H, W = frame.shape[:2]
     face_y2 = y1 + int((y2 - y1) * 0.55)
-    crop = frame[max(0, y1):min(H, face_y2), max(0, x1):min(W, x2)]
+    cx1 = max(0, x1)
+    cy1 = max(0, y1)
+    cx2 = min(W, x2)
+    cy2 = min(H, face_y2)
+    if cx2 <= cx1 or cy2 <= cy1:
+        return None
+    crop = frame[cy1:cy2, cx1:cx2]
     if crop.size == 0:
+        return None
+    if crop.shape[0] < max(20, MIN_OWNER_FACE_SIZE // 2) or crop.shape[1] < max(20, MIN_OWNER_FACE_SIZE // 2):
         return None
 
     if _mtcnn_recognizer is not None:
         from PIL import Image as _PIL_Image
-        pil_crop = _PIL_Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-        face_tensor = _mtcnn_recognizer(pil_crop)
-        if face_tensor is None:
+        try:
+            pil_crop = _PIL_Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            face_tensor = _mtcnn_recognizer(pil_crop)
+            if face_tensor is None:
+                return None
+            # face_tensor: (3, 160, 160) raw pixel values [0,255] — normalise to [-1,1] for FaceNet
+            import torch as _torch
+            face_np = face_tensor.numpy().transpose(1, 2, 0)  # (160,160,3)
+            face_np = (face_np / 255.0 - 0.5) / 0.5
+            face_np = face_np.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+            if owner_recognizer._session is not None:
+                emb = owner_recognizer._session.run(None, {owner_recognizer._input_name: face_np})[0][0]
+            elif owner_recognizer._pt_model is not None:
+                with _torch.no_grad():
+                    emb = owner_recognizer._pt_model(_torch.from_numpy(face_np)).cpu().numpy()[0]
+            else:
+                return None
+            from owner_recognizer_facenet import l2_normalize as _l2
+            return _l2(emb)
+        except RuntimeError as e:
+            # facenet_pytorch MTCNN can throw on crops where no valid candidate face survives.
+            print(f"[DEBUG] MTCNN face extraction skipped: {e}")
             return None
-        # face_tensor: (3, 160, 160) raw pixel values [0,255] — normalise to [-1,1] for FaceNet
-        import torch as _torch
-        face_np = face_tensor.numpy().transpose(1, 2, 0)  # (160,160,3)
-        face_np = (face_np / 255.0 - 0.5) / 0.5
-        face_np = face_np.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
-        if owner_recognizer._session is not None:
-            emb = owner_recognizer._session.run(None, {owner_recognizer._input_name: face_np})[0][0]
-        elif owner_recognizer._pt_model is not None:
-            with _torch.no_grad():
-                emb = owner_recognizer._pt_model(_torch.from_numpy(face_np)).cpu().numpy()[0]
-        else:
+        except Exception as e:
+            print(f"[DEBUG] Face extraction error skipped: {e}")
             return None
-        from owner_recognizer_facenet import l2_normalize as _l2
-        return _l2(emb)
 
     # Haar fallback
     gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -694,12 +713,26 @@ def run_owner_recognition_in_yolo_boxes(frame):
 
     H, W = frame.shape[:2]
 
-    # ── Step 1: MTCNN on full frame — same as test_owner_recognition.py ──────
+    # ── Step 1: MTCNN on (optionally downscaled) frame ───────────────────────
+    # At 720p (1280×720) MTCNN processes 3× more pixels than at 640×480.
+    # Downscale to a max width of 640 px before detection; scale detected boxes
+    # back up so they align with the original-resolution person boxes.
+    _MTCNN_MAX_W = 640
+    if W > _MTCNN_MAX_W:
+        _scale = _MTCNN_MAX_W / W
+        detect_frame = cv2.resize(frame, (_MTCNN_MAX_W, int(H * _scale)))
+    else:
+        _scale = 1.0
+        detect_frame = frame
+
     from PIL import Image as _PIL
-    pil_frame = _PIL.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    pil_frame = _PIL.fromarray(cv2.cvtColor(detect_frame, cv2.COLOR_BGR2RGB))
 
     if _mtcnn_recognizer is not None:
         boxes_det, probs_det = _mtcnn_recognizer.detect(pil_frame)
+        # Scale boxes back to original resolution
+        if boxes_det is not None and _scale != 1.0:
+            boxes_det = [[v / _scale for v in b] for b in boxes_det]
     else:
         # Haar fallback — detect in full frame
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -934,6 +967,22 @@ def assign_weapons_to_people(active_persons, active_objects):
     return assignments
 
 
+def weapon_has_plausible_holder(weapon_box, persons, min_score=1.2):
+    """Reject floating weapon detections that are not spatially plausible for any person."""
+    confirmed_people = [
+        pdata for pdata in persons.values()
+        if pdata.get("confirmed", False)
+    ]
+    if not confirmed_people:
+        return False
+
+    best_score = max(
+        weapon_person_match_score(weapon_box, pdata["bbox"])
+        for pdata in confirmed_people
+    )
+    return best_score >= min_score
+
+
 def update_person_track(person_id, box, conf, source, frame=None):
     if person_id not in active_persons:
         return
@@ -1090,14 +1139,21 @@ while True:
     # missed frame wipes the entry from active_persons, clears
     # recognized_owner_id, and forces a full face-recognition restart —
     # which is why the owner box disappears the moment you move.
-    # Fix: carry every previous entry forward at the motion-predicted position
-    # for up to PERSON_MISSING_FRAMES frames.  Once ByteTracker re-associates
-    # the detection, the real tracked_rows entry takes over normally.
+    # Fix: carry only mature tracks forward briefly at the motion-predicted
+    # position. Normal tracks get a very short grace, while the locked owner
+    # gets a slightly longer one so their box survives brief blur/occlusion
+    # without letting false boxes linger on screen.
     for old_pid, old_data in previous_active_persons.items():
         if old_pid in active_persons:
             continue  # ByteTracker is still actively tracking — no action needed
         missing_count = old_data.get("missing", 0) + 1
-        if missing_count <= PERSON_MISSING_FRAMES:
+        was_owner = old_pid == recognized_owner_id or old_data.get("owner_confirmed", False)
+        seen_count = old_data.get("seen_count", 0)
+        grace_frames = OWNER_PREDICTION_FRAMES if was_owner else NON_OWNER_PREDICTION_FRAMES
+        if not was_owner and seen_count < MIN_SEEN_FRAMES_FOR_PREDICTION:
+            grace_frames = 0
+
+        if missing_count <= grace_frames:
             predicted_box = enhanced_tracker.predict_person_position(old_pid, frame)
             kept_box = predicted_box if predicted_box is not None else old_data["bbox"]
             active_persons[old_pid] = {
@@ -1145,10 +1201,14 @@ while True:
     # Tick ReID store to age out stale lost records
     reid_store.tick()
 
-    # Owner recognition — runs every frame (same cadence as test_owner_recognition.py).
-    # MTCNN on a person crop is fast enough on PC; the streak gate inside the function
-    # prevents false locks without needing a frame-rate limiter here.
-    if OWNER_RECOGNITION_ENABLED:
+    # Owner recognition — every frame on PC; gated on RPi to save CPU.
+    # The streak gate inside the function (OWNER_CONFIRM_FRAMES) prevents false
+    # locks even at the higher cadence used on PC.
+    _run_recognition_this_frame = (
+        OWNER_RECOGNITION_ENABLED and
+        (not config.rpi_mode or frame_count % OWNER_RECOGNITION_EVERY == 0)
+    )
+    if _run_recognition_this_frame:
         run_owner_recognition_in_yolo_boxes(frame)
 
     # Sync identity labels
@@ -1198,6 +1258,12 @@ while True:
             continue
 
         box = [int(x1), int(y1), int(x2), int(y2)]
+
+        # Weapon detections must be spatially plausible for at least one tracked
+        # person. This removes floating false positives like ceiling lights being
+        # labeled as knives.
+        if class_name in WEAPON_CLASSES and not weapon_has_plausible_holder(box, active_persons):
+            continue
 
         matched_id = match_detection_to_tracks(
             box, active_objects, iou_threshold=0.20, dist_threshold=180
@@ -1283,13 +1349,13 @@ while True:
                 if oid in switch_candidate_history:
                     del switch_candidate_history[oid]
 
-    threat_analyzer.cleanup_missing_tracks(active_persons.keys())
-
     # --- Obstacle Detection ---
     obstacle, obstacle_area = obstacle_detector.get_nearest_obstacle(frame, raw_detections)
 
     # --- Global weapon ownership ---
     weapon_assignments = assign_weapons_to_people(active_persons, active_objects)
+
+    threat_analyzer.cleanup_missing_tracks(active_persons.keys())
 
     # --- Draw pending (identifying) persons ---
     # These are real detections that are still in the grace period; show a
@@ -1346,6 +1412,28 @@ while True:
             person_prev_crops[pid] = crop_gray
         person_data["person_moved"] = person_moved
 
+        # ── Aggression: run as an INDEPENDENT step on its own cadence ──────────
+        # update_aggression() rate-limits internally (every N frames) and caches
+        # the result. analyze_person() below just reads the cache — so the two
+        # pipelines run at different frequencies without coupling.
+        if identity != "owner":
+            threat_analyzer.update_aggression(
+                frame, pid, pbox, frame_count, person_moved=person_moved
+            )
+
+        # ── Mask / face-concealment detection ────────────────────────────────
+        # Crop the upper 45 % of the person box (where the face is) and check
+        # whether MTCNN can find a face. No face → concealed → immediate THREAT.
+        # Only checked for non-owners; owner box is always trusted.
+        mask_result = {"mask": False, "label": "UNKNOWN"}
+        if identity != "owner" and mask_detector.enabled:
+            face_y2 = y1c + int((y2c - y1c) * 0.45)
+            face_crop = frame[y1c:face_y2, x1c:x2c] if face_y2 > y1c else None
+            if face_crop is not None and face_crop.size > 0:
+                mask_result = mask_detector.detect(
+                    face_crop, person_box_height=(y2c - y1c)
+                )
+
         person = {
             "id": pid,
             "bbox": pbox,
@@ -1369,11 +1457,16 @@ while True:
             person_moved=person_moved,
         )
 
+        # Masked person overrides whatever threat_analyzer returned.
+        if mask_result.get("mask") and identity != "owner":
+            threat_level  = "THREAT"
+            threat_score  = 95.0
+            explanation   = ["FACE_CONCEALED"]
+
         if len(pbox) != 4:
             print(f"[ERROR] Invalid bbox for drawing person {pid}: {pbox}")
             continue
         x1, y1, x2, y2 = [int(v) for v in pbox]
-        print(f"[DEBUG] Drawing person {pid} with bbox: {pbox} → int: ({x1}, {y1}, {x2}, {y2})")
 
         if is_real_owner:
             color = (255, 255, 0)
@@ -1393,14 +1486,9 @@ while True:
         info_lines = []
 
         if not is_real_owner:
-            info_lines.append(f"threat_score: {threat_score:.1f}")
-            info_lines.append(f"ID_score: {debug.get('identity_score', 0.0):.1f}")
-            info_lines.append(f"weapon_score: {debug.get('weapon_score', 0.0):.1f}")
-            info_lines.append(f"aggr_score: {debug.get('aggression_score', 0.0):.2f}")
-            info_lines.append(f"aggr_pts: {debug.get('aggression_points', 0.0):.1f}")
-            info_lines.append(f"behavior: {debug.get('behavior_score', 0.0):.1f}")
-            info_lines.append(f"owner_prox: {debug.get('owner_proximity_score', 0.0):.1f}")
-            info_lines.append(f"robot_dist: {debug.get('robot_distance_score', 0.0):.1f}")
+            info_lines.append(f"threat: {threat_score:.1f} | {', '.join(explanation)}")
+            info_lines.append(f"aggr: {debug.get('aggression_score', 0.0):.2f} | weapon: {'yes' if debug.get('has_weapon') else 'no'}")
+            info_lines.append(f"face: {mask_result.get('label', 'UNKNOWN')}")
 
         info_lines.append(f"person_conf: {person_data['conf']:.2f}")
         info_lines.append(f"source: {person_data.get('source', 'yolo')}")

@@ -164,7 +164,7 @@ class AggressionAnalyzer:
         hand_result = self.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
 
         # ---- FACE blendshapes ----
-        brow_down = eye_squint = smile = lip_press = nose_sneer = 0.0
+        brow_down = eye_squint = mouth_close = brow_squint_combo = 0.0
         angry_face_score = 0.0
         face_score_raw = 0.0
 
@@ -174,21 +174,31 @@ class AggressionAnalyzer:
                 for x in face_result.face_blendshapes[0]
             }
 
-            brow_down  = 0.5 * (shapes.get("browDownLeft",    0.0) + shapes.get("browDownRight",   0.0))
-            eye_squint = 0.5 * (shapes.get("eyeSquintLeft",   0.0) + shapes.get("eyeSquintRight",  0.0))
-            smile      = 0.5 * (shapes.get("mouthSmileLeft",  0.0) + shapes.get("mouthSmileRight", 0.0))
-            lip_press  = 0.5 * (shapes.get("mouthPressLeft",  0.0) + shapes.get("mouthPressRight", 0.0))
-            nose_sneer = 0.5 * (shapes.get("noseSneerLeft",   0.0) + shapes.get("noseSneerRight",  0.0))
+            # ── Three anger signals the user defined ────────────────────────
+            # 1. Eyebrows frowning (pulling down)
+            brow_down  = 0.5 * (shapes.get("browDownLeft",  0.0) + shapes.get("browDownRight", 0.0))
+            # 2. Teeth / jaw clenching (lips pressed shut, jaw closed tight)
+            mouth_close = shapes.get("mouthClose", 0.0)
+            # 3. Eyes narrowing — only meaningful when brows are also frowning
+            eye_squint = 0.5 * (shapes.get("eyeSquintLeft", 0.0) + shapes.get("eyeSquintRight", 0.0))
 
-            # Smile reduces anger score — genuine smiles cancel aggression signals
+            # Combination bonus: brow frown + eye squint together → clear anger
+            brow_squint_combo = brow_down * eye_squint   # product: both must be active
+
+            # Smile is intentionally NOT used — should have no effect on the score
             angry_face_score = clamp(
-                0.30 * brow_down  +
-                0.18 * eye_squint +
-                0.26 * lip_press  +
-                0.14 * nose_sneer -
-                0.18 * smile
+                0.40 * brow_down        +   # primary: brows frowning alone
+                0.30 * mouth_close      +   # secondary: teeth clenched / jaw shut
+                0.30 * brow_squint_combo    # amplifier: frown + narrowed eyes
             )
             face_score_raw = angry_face_score
+
+            # Expose these for the debug dict even though some old keys are removed
+            brow_down   = brow_down
+            eye_squint  = eye_squint
+            smile       = 0.0   # kept for debug key parity; not used in scoring
+            lip_press   = 0.0
+            nose_sneer  = 0.0
 
         # ---- HANDS ----
         fist_count = 0
@@ -291,9 +301,8 @@ class AggressionAnalyzer:
             "debug": {
                 "brow_down":            brow_down,
                 "eye_squint":           eye_squint,
-                "lip_press":            lip_press,
-                "nose_sneer":           nose_sneer,
-                "smile":                smile,
+                "mouth_close":          mouth_close,
+                "brow_squint_combo":    brow_squint_combo,
                 "angry_face_score":     angry_face_score,
                 "fist_count":           fist_count,
                 "has_fist":             has_fist,
