@@ -1,16 +1,4 @@
-"""
-FaceNet-based owner recognizer.
-
-Runtime strategy (fastest to slowest, tried in order):
-  1. ONNX Runtime  — 2-3× faster than PyTorch on CPU (recommended for RPi)
-  2. PyTorch CPU   — fallback if onnxruntime is not installed
-
-The ONNX model is exported automatically from the PyTorch weights on first run
-(takes ~20 s, one-time only). Both paths produce identical embeddings.
-
-Install ONNX Runtime (strongly recommended for RPi):
-    pip install onnxruntime
-"""
+# It embeds faces with FaceNet and compares them to enrolled owner embeddings using cosine_distance
 
 import os
 import numpy as np

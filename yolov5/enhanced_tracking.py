@@ -20,97 +20,149 @@ from collections import deque
 # ---------------------------
 # MOTION PREDICTOR
 # ---------------------------
+# This class predicts where a person box should be for a few short missing-frame
+# gaps after ByteTrack fails to return that person. It uses a lightweight
+# constant-velocity Kalman-style model so the fallback is smoother and less
+# jittery than raw linear extrapolation, while staying cheap enough for the Pi.
 class MotionPredictor:
-    """Simple motion prediction using linear extrapolation"""
+    """Lightweight constant-velocity Kalman predictor for short box dropouts."""
 
     def __init__(self, history_size=5):
         self.history = collections.deque(maxlen=history_size)
         self.size_history = collections.deque(maxlen=history_size)
-        self.velocity = [0, 0]
+        self._dt = 1.0
+        self._F = np.array([
+            [1, 0, 0, 0, self._dt, 0, 0, 0],
+            [0, 1, 0, 0, 0, self._dt, 0, 0],
+            [0, 0, 1, 0, 0, 0, self._dt, 0],
+            [0, 0, 0, 1, 0, 0, 0, self._dt],
+            [0, 0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+        self._H = np.array([
+            [1, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0, 0],
+        ], dtype=np.float32)
+        self._Q = np.diag([1.0, 1.0, 0.8, 0.8, 4.0, 4.0, 2.0, 2.0]).astype(np.float32)
+        self._R = np.diag([16.0, 16.0, 25.0, 25.0]).astype(np.float32)
+        self._I = np.eye(8, dtype=np.float32)
+        self.state = None
+        self.cov = None
         self.last_prediction = None
 
+    def _predict_internal(self, steps=1):
+        if self.state is None:
+            return None, None
+
+        predicted_state = self.state.copy()
+        predicted_cov = self.cov.copy()
+        for _ in range(max(1, int(steps))):
+            predicted_state = self._F @ predicted_state
+            predicted_cov = self._F @ predicted_cov @ self._F.T + self._Q
+        return predicted_state, predicted_cov
+
     def update(self, box):
-        """Update with new measurement"""
+        """Update the filter with a measured bounding box."""
         x1, y1, x2, y2 = box
-        center = [(x1 + x2) / 2, (y1 + y2) / 2]
-        size = [x2 - x1, y2 - y1]
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
 
-        self.history.append(center)
-        self.size_history.append(size)
+        self.history.append([cx, cy])
+        self.size_history.append([w, h])
+        measurement = np.array([cx, cy, w, h], dtype=np.float32)
 
-        # Update velocity if we have enough history
-        if len(self.history) >= 2:
-            prev = self.history[-2]
-            curr = self.history[-1]
-            self.velocity = [curr[0] - prev[0], curr[1] - prev[1]]
+        if self.state is None:
+            vx = vy = vw = vh = 0.0
+            if len(self.history) >= 2 and len(self.size_history) >= 2:
+                prev_center = self.history[-2]
+                prev_size = self.size_history[-2]
+                vx = cx - prev_center[0]
+                vy = cy - prev_center[1]
+                vw = w - prev_size[0]
+                vh = h - prev_size[1]
+            self.state = np.array([cx, cy, w, h, vx, vy, vw, vh], dtype=np.float32)
+            self.cov = np.diag([25.0, 25.0, 36.0, 36.0, 100.0, 100.0, 64.0, 64.0]).astype(np.float32)
+            self.last_prediction = [int(x1), int(y1), int(x2), int(y2)]
+            return
+
+        self.state = self._F @ self.state
+        self.cov = self._F @ self.cov @ self._F.T + self._Q
+
+        innovation = measurement - (self._H @ self.state)
+        innovation_cov = self._H @ self.cov @ self._H.T + self._R
+        kalman_gain = self.cov @ self._H.T @ np.linalg.inv(innovation_cov)
+
+        self.state = self.state + kalman_gain @ innovation
+        self.cov = (self._I - kalman_gain @ self._H) @ self.cov
 
     def predict(self, steps=1):
-        """Predict next position using linear extrapolation"""
-        if len(self.history) < 2:
+        """Predict the next box using the current filtered state."""
+        predicted_state, predicted_cov = self._predict_internal(steps)
+        if predicted_state is None:
             return None
 
-        last_center = self.history[-1]
-        predicted_center = [
-            last_center[0] + self.velocity[0] * steps,
-            last_center[1] + self.velocity[1] * steps
-        ]
-
-        if len(self.size_history) >= 2:
-            last_size = self.size_history[-1]
-            size_velocity = [
-                self.size_history[-1][0] - self.size_history[-2][0],
-                self.size_history[-1][1] - self.size_history[-2][1]
-            ]
-            predicted_size = [
-                last_size[0] + size_velocity[0] * steps,
-                last_size[1] + size_velocity[1] * steps
-            ]
-        else:
-            predicted_size = self.size_history[-1] if self.size_history else [100, 200]
-
-        # Convert back to bounding box
-        w, h = predicted_size
-        cx, cy = predicted_center
+        cx, cy, w, h = predicted_state[:4]
+        w = max(1.0, float(w))
+        h = max(1.0, float(h))
         x1 = cx - w / 2
         y1 = cy - h / 2
         x2 = cx + w / 2
         y2 = cy + h / 2
 
+        self.state = predicted_state
+        self.cov = predicted_cov
         self.last_prediction = [int(x1), int(y1), int(x2), int(y2)]
         return self.last_prediction
+
+    def peek_predict(self, steps=1):
+        """Return a predicted box without advancing the filter state."""
+        predicted_state, _ = self._predict_internal(steps)
+        if predicted_state is None:
+            return None
+
+        cx, cy, w, h = predicted_state[:4]
+        w = max(1.0, float(w))
+        h = max(1.0, float(h))
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        return [int(x1), int(y1), int(x2), int(y2)]
 
 
 # ---------------------------
 # ENHANCED FINGERPRINT
 # ---------------------------
 class AdaptiveFingerprint:
-    """Enhanced fingerprint with multiple visual features"""
+    """
+    Lightweight appearance fingerprint used for short-term person re-matching.
+
+    The current project only uses the basic color-histogram path, so this class
+    intentionally stays simple and Pi-friendly. The `enhanced` and
+    `pose_landmarks` arguments are kept only for API compatibility with the
+    surrounding tracking code.
+    """
 
     def __init__(self):
         self.base_color_hist = None
-        self.enhanced_color_hist = None
-        self.shape_feats = None
-        self.edge_profile = None
-        self.hog_features = None
-        self.spatial_color = None
-        self.skeletal_signatures = None  # Geometric ratios from pose landmarks
-        # Per-zone histograms: [head/hair, torso/shirt, lower-body]
-        # Zone boundaries (fraction of box height): 0–0.25, 0.25–0.65, 0.65–1.0
-        self.zone_hists = None   # list of 3 normalised HSV histograms
-        self.needs_enhanced = False
-
-        # Multi-view snapshot gallery — stores up to 20 (base_hist, zone_hists)
-        # tuples captured at different times/angles while the owner is tracked.
-        # compare_best_snapshot() returns the best match across all of them,
-        # enabling re-ID even when the owner reappears from a different angle.
-        self.snapshot_hists = []
-
-        # Update tracking
         self.update_counter = 0
         self.stable_frames = 0
+        self.snapshot_hists = []
+
+    def _compute_base_hist(self, roi):
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1, 2], None,
+                            [8, 8, 8], [0, 180, 0, 256, 0, 256])
+        return cv2.normalize(hist, hist).flatten()
 
     def build(self, frame, box, enhanced=False):
-        """Build initial fingerprint"""
+        """Build the initial lightweight fingerprint."""
         try:
             x1, y1, x2, y2 = [int(v) for v in box]
             h, w = frame.shape[:2]
@@ -124,43 +176,27 @@ class AdaptiveFingerprint:
             if roi.size == 0:
                 return False
 
-            # Basic color histogram
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            self.base_color_hist = cv2.calcHist([hsv], [0, 1, 2], None,
-                                              [8, 8, 8], [0, 180, 0, 256, 0, 256])
-            self.base_color_hist = cv2.normalize(self.base_color_hist, self.base_color_hist).flatten()
-
-            if enhanced:
-                self.needs_enhanced = True
-                # Enhanced features for crowded scenes
-                self.enhanced_color_hist = self._compute_enhanced_color_hist(hsv)
-                self.shape_feats = self._compute_shape_features(roi)
-                self.edge_profile = self._compute_edge_profile(roi)
-                self.spatial_color = self._compute_spatial_color(roi)
-                # HOG features (simplified)
-                self.hog_features = self._compute_simple_hog(roi)
-                # Per-zone histograms: head/hair, torso, lower-body
-                self.zone_hists = self._compute_zone_hists(roi)
-
+            self.base_color_hist = self._compute_base_hist(roi)
+            self.snapshot_hists = [self.base_color_hist.copy()]
             return True
         except Exception as e:
             print(f"Fingerprint build error: {e}")
             return False
 
     def update(self, frame, box, score):
-        """Gradually update fingerprint with new observations"""
+        """Gradually refresh the base histogram when the track is stable."""
         try:
             self.update_counter += 1
 
-            # Only update if score is good and we've seen stability
             if score > 0.7:
                 self.stable_frames += 1
             else:
                 self.stable_frames = max(0, self.stable_frames - 1)
 
-            # Update every 10 stable frames
+            if self.base_color_hist is None:
+                return
+
             if self.stable_frames >= 10 and self.update_counter % 10 == 0:
-                alpha = 0.1  # Slow update rate
                 x1, y1, x2, y2 = [int(v) for v in box]
                 h, w = frame.shape[:2]
                 x1, x2 = max(0, x1), min(w, x2)
@@ -168,431 +204,47 @@ class AdaptiveFingerprint:
 
                 if x2 > x1 and y2 > y1:
                     roi = frame[y1:y2, x1:x2]
-                    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                    new_hist = cv2.calcHist([hsv], [0, 1, 2], None,
-                                           [8, 8, 8], [0, 180, 0, 256, 0, 256])
-                    new_hist = cv2.normalize(new_hist, new_hist).flatten()
+                    new_hist = self._compute_base_hist(roi)
+                    alpha = 0.1
+                    self.base_color_hist = (1 - alpha) * self.base_color_hist + alpha * new_hist
 
-                    if self.base_color_hist is not None:
-                        self.base_color_hist = (1 - alpha) * self.base_color_hist + alpha * new_hist
-
+                    # Keep a tiny gallery of distinct appearance snapshots so
+                    # re-matching survives small viewpoint / lighting changes.
+                    is_new_view = True
+                    for snap in self.snapshot_hists:
+                        if float(cv2.compareHist(snap, new_hist, cv2.HISTCMP_CORREL)) > 0.95:
+                            is_new_view = False
+                            break
+                    if is_new_view:
+                        self.snapshot_hists.append(new_hist.copy())
+                        if len(self.snapshot_hists) > 4:
+                            self.snapshot_hists.pop(0)
         except Exception as e:
             print(f"Fingerprint update error: {e}")
 
     def compare(self, frame, box, pose_landmarks=None, enhanced=False):
-        """Compare candidate with fingerprint"""
+        """Compare a candidate crop against the stored base histogram."""
         try:
             x1, y1, x2, y2 = [int(v) for v in box]
             h, w = frame.shape[:2]
             x1, x2 = max(0, x1), min(w, x2)
             y1, y2 = max(0, y1), min(h, y2)
 
-            if x2 <= x1 or y2 <= y1:
+            if x2 <= x1 or y2 <= y1 or self.base_color_hist is None:
                 return 0.0
 
             roi = frame[y1:y2, x1:x2]
             if roi.size == 0:
                 return 0.0
 
-            # Basic color comparison
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            hist = cv2.calcHist([hsv], [0, 1, 2], None,
-                              [8, 8, 8], [0, 180, 0, 256, 0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-
-            if self.base_color_hist is None:
-                return 0.0
-
-            base_score = cv2.compareHist(self.base_color_hist, hist, cv2.HISTCMP_CORREL)
-
-            if not enhanced or not self.needs_enhanced:
-                return float(base_score)
-
-            # Enhanced comparison
-            # Weights (sum = 1.0 when all features present):
-            #   zone_hists   0.40  — head/hair + shirt + trousers compared separately
-            #   edge_profile 0.20  — body silhouette / shape
-            #   enh_color    0.15  — whole-body colour (backup when zones are weak)
-            #   spatial_color 0.10 — quadrant colours
-            #   hog          0.10  — gradient orientations / body shape
-            #   shape_feats  0.03  — Hu moments (low — not very discriminative)
-            #   skeletal     0.02  — pose ratios (rarely available on RPi)
-            enhanced_score = 0.0
-
-            # Zone histograms: head/hair · torso/shirt · lower-body
-            # Per-zone weights: head 0.25, torso 0.45, lower 0.30
-            if self.zone_hists is not None:
-                new_zones = self._compute_zone_hists(roi)
-                if new_zones is not None:
-                    zone_weights = [0.25, 0.45, 0.30]
-                    zone_score = 0.0
-                    for saved_z, new_z, wz in zip(self.zone_hists, new_zones, zone_weights):
-                        s = float(cv2.compareHist(saved_z, new_z, cv2.HISTCMP_CORREL))
-                        zone_score += wz * max(0.0, s)
-                    enhanced_score += 0.40 * zone_score
-
-            # Edge profile — body silhouette / shape
-            if self.edge_profile is not None:
-                new_edges = self._compute_edge_profile(roi)
-                if new_edges is not None:
-                    edge_sim = np.corrcoef(self.edge_profile, new_edges)[0, 1]
-                    enhanced_score += 0.20 * max(0.0, float(edge_sim))
-
-            # Whole-body enhanced colour histogram (backup)
-            if self.enhanced_color_hist is not None:
-                enh_hist = cv2.calcHist([hsv], [0, 1, 2], None,
-                                        [16, 16, 16], [0, 180, 0, 256, 0, 256])
-                enh_hist = cv2.normalize(enh_hist, enh_hist).flatten()
-                enhanced_score += 0.15 * max(0.0, float(
-                    cv2.compareHist(self.enhanced_color_hist, enh_hist, cv2.HISTCMP_CORREL)))
-
-            # Spatial colour (4 quadrants)
-            if self.spatial_color is not None:
-                new_spatial = self._compute_spatial_color(roi)
-                if new_spatial is not None:
-                    spatial_sim = cv2.compareHist(self.spatial_color, new_spatial, cv2.HISTCMP_CORREL)
-                    enhanced_score += 0.10 * max(0.0, float(spatial_sim))
-
-            # HOG — gradient-based shape descriptor
-            if self.hog_features is not None:
-                new_hog = self._compute_simple_hog(roi)
-                if new_hog is not None:
-                    hog_sim = np.dot(self.hog_features, new_hog) / (
-                        np.linalg.norm(self.hog_features) * np.linalg.norm(new_hog))
-                    enhanced_score += 0.10 * max(0.0, float(hog_sim))
-
-            # Shape features (Hu moments — low weight, not very discriminative)
-            if self.shape_feats is not None:
-                new_shape = self._compute_shape_features(roi)
-                if new_shape is not None:
-                    shape_sim = np.dot(self.shape_feats, new_shape) / (
-                        np.linalg.norm(self.shape_feats) * np.linalg.norm(new_shape))
-                    enhanced_score += 0.03 * max(0.0, float(shape_sim))
-
-            # Skeletal signatures (pose ratios — rarely available on RPi)
-            if pose_landmarks and self.skeletal_signatures is not None:
-                candidate_signatures = self._extract_skeletal_signatures(pose_landmarks)
-                if candidate_signatures is not None:
-                    skeletal_score = self.compare_skeletal(candidate_signatures)
-                    enhanced_score += 0.02 * skeletal_score
-
-            return float(0.5 * base_score + 0.5 * enhanced_score)
-
+            hist = self._compute_base_hist(roi)
+            scores = [float(cv2.compareHist(self.base_color_hist, hist, cv2.HISTCMP_CORREL))]
+            for snap in self.snapshot_hists:
+                scores.append(float(cv2.compareHist(snap, hist, cv2.HISTCMP_CORREL)))
+            return max(scores)
         except Exception as e:
             print(f"Fingerprint compare error: {e}")
             return 0.0
-
-    def add_snapshot(self, frame, box):
-        """Capture the owner's current appearance and add it to the multi-view
-        snapshot gallery.  Called every few frames while the owner is tracked so
-        the gallery accumulates front, side, and back-view samples.  Near-
-        duplicate frames (histogram correlation > 0.96) are skipped so each
-        entry represents a genuinely different appearance angle or pose."""
-        try:
-            x1, y1, x2, y2 = [int(v) for v in box]
-            h, w = frame.shape[:2]
-            x1, x2 = max(0, x1), min(w, x2)
-            y1, y2 = max(0, y1), min(h, y2)
-            if x2 <= x1 or y2 <= y1:
-                return
-            roi = frame[y1:y2, x1:x2]
-            if roi.size == 0:
-                return
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            base_hist = cv2.calcHist([hsv], [0, 1, 2], None,
-                                     [8, 8, 8], [0, 180, 0, 256, 0, 256])
-            base_hist = cv2.normalize(base_hist, base_hist).flatten().astype(np.float32)
-            zone_hists = self._compute_zone_hists(roi)
-            # Skip near-duplicate snapshots to keep the gallery diverse
-            for (existing_base, _) in self.snapshot_hists:
-                if float(cv2.compareHist(existing_base, base_hist, cv2.HISTCMP_CORREL)) > 0.96:
-                    return
-            self.snapshot_hists.append((base_hist, zone_hists))
-            if len(self.snapshot_hists) > 20:
-                self.snapshot_hists.pop(0)
-        except Exception as e:
-            print(f"Fingerprint add_snapshot error: {e}")
-
-    def compare_best_snapshot(self, frame, box):
-        """Compare the candidate crop against every stored snapshot and return
-        the BEST (highest) score.  This is the primary re-ID path when the owner
-        reappears from an angle that doesn't match the blended base histogram."""
-        if not self.snapshot_hists:
-            return 0.0
-        try:
-            x1, y1, x2, y2 = [int(v) for v in box]
-            h, w = frame.shape[:2]
-            x1, x2 = max(0, x1), min(w, x2)
-            y1, y2 = max(0, y1), min(h, y2)
-            if x2 <= x1 or y2 <= y1:
-                return 0.0
-            roi = frame[y1:y2, x1:x2]
-            if roi.size == 0:
-                return 0.0
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            cur_base = cv2.calcHist([hsv], [0, 1, 2], None,
-                                    [8, 8, 8], [0, 180, 0, 256, 0, 256])
-            cur_base = cv2.normalize(cur_base, cur_base).flatten().astype(np.float32)
-            cur_zones = self._compute_zone_hists(roi)
-            best = 0.0
-            for (snap_base, snap_zones) in self.snapshot_hists:
-                s_base = max(0.0, float(cv2.compareHist(snap_base, cur_base, cv2.HISTCMP_CORREL)))
-                if cur_zones is not None and snap_zones is not None:
-                    zone_weights = [0.25, 0.45, 0.30]
-                    s_zone = sum(
-                        wz * max(0.0, float(cv2.compareHist(sz, nz, cv2.HISTCMP_CORREL)))
-                        for sz, nz, wz in zip(snap_zones, cur_zones, zone_weights)
-                    )
-                    score = 0.5 * s_base + 0.5 * s_zone
-                else:
-                    score = s_base
-                best = max(best, score)
-            return float(best)
-        except Exception as e:
-            print(f"Fingerprint compare_best_snapshot error: {e}")
-            return 0.0
-
-    def _compute_enhanced_color_hist(self, hsv):
-        """Compute enhanced color histogram with spatial weighting"""
-        hist = cv2.calcHist([hsv], [0, 1, 2], None,
-                          [16, 16, 16], [0, 180, 0, 256, 0, 256])
-        return cv2.normalize(hist, hist).flatten()
-
-    def _compute_zone_hists(self, roi):
-        """Split the person bounding box into 3 vertical zones and compute
-        a colour histogram for each:
-          Zone 0 (top 25%)  — head / hair region
-          Zone 1 (25–65%)   — torso / shirt
-          Zone 2 (65–100%)  — lower body / trousers
-
-        Returns a list of 3 normalised HSV histograms, or None on failure.
-        Each histogram uses 12 × 12 Hue × Saturation bins (ignores Value to
-        reduce lighting sensitivity).
-        """
-        try:
-            h, w = roi.shape[:2]
-            if h < 30:   # too small to zone reliably
-                return None
-            boundaries = [0, int(0.25 * h), int(0.65 * h), h]
-            zones = []
-            for i in range(3):
-                zone = roi[boundaries[i]:boundaries[i + 1], :]
-                if zone.size == 0:
-                    zones.append(np.zeros((12 * 12,), dtype=np.float32))
-                    continue
-                hsv_z = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
-                # Use only Hue + Saturation — Value changes with lighting
-                z_hist = cv2.calcHist([hsv_z], [0, 1], None,
-                                      [12, 12], [0, 180, 0, 256])
-                z_hist = cv2.normalize(z_hist, z_hist).flatten().astype(np.float32)
-                zones.append(z_hist)
-            return zones
-        except Exception as e:
-            print(f"Zone hist error: {e}")
-            return None
-
-    def _compute_shape_features(self, roi):
-        """Compute shape-based features"""
-        try:
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            # Simple shape descriptors
-            moments = cv2.moments(gray)
-            hu_moments = cv2.HuMoments(moments).flatten()
-            return hu_moments / np.linalg.norm(hu_moments) if np.linalg.norm(hu_moments) > 0 else None
-        except:
-            return None
-
-    def _compute_edge_profile(self, roi):
-        """Compute edge profile"""
-        try:
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray, 50, 150)
-            # Horizontal and vertical projections
-            h_proj = np.sum(edges, axis=0) / max(1, np.sum(edges))
-            v_proj = np.sum(edges, axis=1) / max(1, np.sum(edges))
-            return np.concatenate([h_proj, v_proj])
-        except:
-            return None
-
-    def _compute_spatial_color(self, roi):
-        """Compute spatial color distribution"""
-        try:
-            # Divide into 4 quadrants and compute color histograms
-            h, w = roi.shape[:2]
-            h_mid, w_mid = h // 2, w // 2
-
-            quadrants = [
-                roi[:h_mid, :w_mid],
-                roi[:h_mid, w_mid:],
-                roi[h_mid:, :w_mid],
-                roi[h_mid:, w_mid:]
-            ]
-
-            hist = []
-            for quad in quadrants:
-                if quad.size > 0:
-                    hsv = cv2.cvtColor(quad, cv2.COLOR_BGR2HSV)
-                    q_hist = cv2.calcHist([hsv], [0, 1, 2], None,
-                                        [4, 4, 4], [0, 180, 0, 256, 0, 256])
-                    hist.extend(q_hist.flatten())
-                else:
-                    hist.extend([0] * 64)
-
-            hist = np.array(hist)
-            return cv2.normalize(hist, hist).flatten()
-        except:
-            return None
-
-    def _compute_simple_hog(self, roi):
-        """Compute simplified HOG features"""
-        try:
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            resized = cv2.resize(gray, (64, 128))
-
-            # Simple gradient computation
-            gx = cv2.Sobel(resized, cv2.CV_32F, 1, 0, ksize=1)
-            gy = cv2.Sobel(resized, cv2.CV_32F, 0, 1, ksize=1)
-            mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=True)
-
-            # Simple binning (9 bins for 0-180 degrees)
-            bins = np.zeros(9)
-            for i in range(9):
-                mask = (ang >= i*20) & (ang < (i+1)*20)
-                bins[i] = np.sum(mag[mask])
-
-            return bins / np.linalg.norm(bins) if np.linalg.norm(bins) > 0 else None
-        except:
-            return None
-
-
-# ---------------------------
-# SKELETAL SIGNATURE METHODS
-# ---------------------------
-    def build_with_pose(self, frame, box, pose_landmarks, enhanced=False):
-        """Build fingerprint with pose landmarks for skeletal signatures"""
-        # First build regular fingerprint
-        success = self.build(frame, box, enhanced)
-
-        if success and pose_landmarks:
-            self.skeletal_signatures = self._extract_skeletal_signatures(pose_landmarks)
-
-        return success
-
-    def _extract_skeletal_signatures(self, landmarks):
-        """Extract view-angle invariant geometric ratios from pose landmarks"""
-        try:
-            # Define key landmark indices (MediaPipe pose landmarks)
-            NOSE = 0
-            LEFT_SHOULDER = 11
-            RIGHT_SHOULDER = 12
-            LEFT_HIP = 23
-            RIGHT_HIP = 24
-            LEFT_KNEE = 25
-            RIGHT_KNEE = 26
-            LEFT_ANKLE = 27
-            RIGHT_ANKLE = 28
-
-            # Extract 3D coordinates (x, y, z) - using only x,y for now since z might be less reliable
-            def get_point(idx):
-                return np.array([landmarks[idx].x, landmarks[idx].y])
-
-            # Key body measurements (distances)
-            shoulder_width = np.linalg.norm(get_point(LEFT_SHOULDER) - get_point(RIGHT_SHOULDER))
-            hip_width = np.linalg.norm(get_point(LEFT_HIP) - get_point(RIGHT_HIP))
-            left_leg_length = np.linalg.norm(get_point(LEFT_HIP) - get_point(LEFT_ANKLE))
-            right_leg_length = np.linalg.norm(get_point(RIGHT_HIP) - get_point(RIGHT_ANKLE))
-            torso_height = np.linalg.norm(get_point(NOSE) - (get_point(LEFT_HIP) + get_point(RIGHT_HIP)) / 2)
-
-            # Ratios that are view-angle invariant
-            shoulder_to_hip_ratio = shoulder_width / hip_width if hip_width > 0 else 0
-            leg_to_torso_ratio = (left_leg_length + right_leg_length) / 2 / torso_height if torso_height > 0 else 0
-            left_right_leg_ratio = left_leg_length / right_leg_length if right_leg_length > 0 else 1
-
-            # Additional geometric features
-            knee_height_ratio = (np.linalg.norm(get_point(LEFT_KNEE) - get_point(LEFT_HIP)) +
-                               np.linalg.norm(get_point(RIGHT_KNEE) - get_point(RIGHT_HIP))) / 2 / torso_height if torso_height > 0 else 0
-
-            # Store as normalized feature vector
-            signatures = np.array([
-                shoulder_to_hip_ratio,
-                leg_to_torso_ratio,
-                left_right_leg_ratio,
-                knee_height_ratio,
-                shoulder_width,  # absolute measurements for additional context
-                torso_height
-            ])
-
-            # Normalize to make comparison scale-invariant
-            signatures = signatures / np.linalg.norm(signatures) if np.linalg.norm(signatures) > 0 else signatures
-
-            return signatures
-
-        except Exception as e:
-            print(f"Skeletal signature extraction error: {e}")
-            return None
-
-    def compare_skeletal(self, other_signatures):
-        """Compare skeletal signatures using cosine similarity"""
-        if self.skeletal_signatures is None or other_signatures is None:
-            return 0.0
-
-        try:
-            # Cosine similarity for normalized vectors
-            similarity = np.dot(self.skeletal_signatures, other_signatures) / (
-                np.linalg.norm(self.skeletal_signatures) * np.linalg.norm(other_signatures)
-            )
-            return max(0.0, min(1.0, similarity))  # Clamp to [0, 1]
-        except:
-            return 0.0
-
-
-# ---------------------------
-# OBSTACLE DETECTOR
-# ---------------------------
-class ObstacleDetector:
-    """Detect obstacles (non-person objects) in danger zone"""
-
-    def __init__(self, min_obstacle_area_ratio=0.01):
-        self.min_obstacle_area_ratio = min_obstacle_area_ratio
-        self.last_obstacles = []
-
-    def get_nearest_obstacle(self, frame, yolo_results):
-        """Find nearest obstacle in danger zone"""
-        if yolo_results is None:
-            return None, 0
-
-        obstacles = []
-        frame_area = frame.shape[0] * frame.shape[1]
-
-        # Extract non-person detections as potential obstacles
-        for det in yolo_results:
-            x1, y1, x2, y2, conf, cls = det
-            cls = int(cls)
-
-            # Skip persons (class 0)
-            if cls == 0:
-                continue
-
-            area = (x2 - x1) * (y2 - y1)
-            area_ratio = area / frame_area
-
-            if area_ratio >= self.min_obstacle_area_ratio:
-                obstacles.append({
-                    'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                    'conf': float(conf),
-                    'class': cls,
-                    'area_ratio': area_ratio
-                })
-
-        if not obstacles:
-            self.last_obstacles = []
-            return None, 0
-
-        # Find obstacle with highest confidence
-        best_obstacle = max(obstacles, key=lambda x: x['conf'])
-        self.last_obstacles = obstacles
-
-        return best_obstacle['bbox'], best_obstacle['area_ratio']
 
 
 # ---------------------------
@@ -661,18 +313,19 @@ class BodyguardConfig:
     def update_for_rpi(self):
         """Update settings for Raspberry Pi performance"""
         self.rpi_mode = True
-        self.camera_width = 320
-        self.camera_height = 240
-        self.camera_fps = 10
-        self.yolo_every_n_frames = 5
-        self.owner_recognition_every = 15
+        self.camera_width = 640
+        self.camera_height = 480
+        self.camera_fps = 15
+        self.yolo_every_n_frames = 2   # async thread; 640×480 is fast enough at this rate
+        self.owner_recognition_every = 2  # run face recognition every 2 frames on Pi
         self.min_owner_face_size = 25
 
 
 # ---------------------------
 # PERSON RE-ID STORE
 # ---------------------------
-
+# Without it, the same real person could keep getting a new displayed ID whenever the tracker 
+# resets
 class PersonReIDStore:
     """
     Face-based person re-identification store.
@@ -684,7 +337,7 @@ class PersonReIDStore:
     No body histograms.  No lost pool.  One job: face → stable_id.
     """
 
-    EXPIRY_SECONDS = 120   # forget a person if not seen for 2 minutes
+    EXPIRY_SECONDS = 50   # forget a person if not seen for 50 seconds
 
     def __init__(self):
         self._records     = []   # list of dicts: {face_emb, stable_id, is_owner, last_seen}
@@ -759,6 +412,9 @@ class PersonReIDStore:
 # ---------------------------
 # ENHANCED VISUALIZATION
 # ---------------------------
+# These functions are all about drawing visual information on your video frame so we can see 
+# what your system is thinking. They don’t affect tracking or detection logic at all, 
+# they just overlay graphics.
 def draw_angle_indicator(frame, angle_deg, frame_width, center_y=80, radius=40):
     """Draw angle indicator on frame"""
     center_x = frame_width // 2
@@ -847,6 +503,10 @@ def draw_confidence_bar(frame, confidence, x=10, y=50, width=150, height=10):
 # ---------------------------
 # ENHANCED TRACKER INTEGRATION
 # ---------------------------
+# It does 3 main things:
+# 1. Remembers how each person moves using MotionPredictor
+# 2. Remembers what each person looks like using AdaptiveFingerprint
+# 3. Helps recover from short misses by predicting position and comparing appearance
 class EnhancedPersonTracker:
     """Enhanced person tracker with motion prediction and advanced features"""
 
@@ -928,11 +588,34 @@ class EnhancedPersonTracker:
         return best_match
 
     def compare_fingerprint(self, track_id, frame, candidate_box, enhanced=False):
-        """Compare candidate box with stored fingerprint"""
+        """Compare candidate box with stored appearance plus geometry consistency."""
         if track_id not in self.fingerprints:
             return 0.0
 
-        return self.fingerprints[track_id].compare(frame, candidate_box, enhanced)
+        appearance = self.fingerprints[track_id].compare(frame, candidate_box, enhanced=enhanced)
+        geometry = 0.0
+
+        if track_id in self.last_boxes:
+            last_box = self.last_boxes[track_id]
+            last_iou = self._calculate_iou(last_box, candidate_box)
+
+            last_w = max(1.0, float(last_box[2] - last_box[0]))
+            last_h = max(1.0, float(last_box[3] - last_box[1]))
+            cand_w = max(1.0, float(candidate_box[2] - candidate_box[0]))
+            cand_h = max(1.0, float(candidate_box[3] - candidate_box[1]))
+
+            size_ratio = min(cand_w / last_w, last_w / cand_w) * min(cand_h / last_h, last_h / cand_h)
+            geometry += 0.45 * max(0.0, float(last_iou))
+            geometry += 0.20 * max(0.0, float(size_ratio))
+
+        predictor = self.motion_predictors.get(track_id)
+        if predictor is not None:
+            pred_box = predictor.peek_predict()
+            if pred_box is not None:
+                pred_iou = self._calculate_iou(pred_box, candidate_box)
+                geometry += 0.35 * max(0.0, float(pred_iou))
+
+        return float(0.65 * max(0.0, appearance) + 0.35 * min(1.0, geometry))
 
     def cleanup_missing_tracks(self, active_track_ids):
         """Remove tracking data for disappeared persons"""

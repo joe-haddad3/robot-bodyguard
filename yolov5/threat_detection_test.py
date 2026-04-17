@@ -1,3 +1,7 @@
+# The orchestrator: It opens the camera, runs YOLO, feeds person detections into ByteTrack, 
+# runs owner recognition, assigns weapons to people, calls threat analysis, and draws 
+# everything on screen.
+
 import cv2
 import torch
 import math
@@ -13,7 +17,7 @@ from enhanced_threat_analyzer import EnhancedThreatAnalyzer
 from camera_utils import LatestFrameCamera, make_camera
 from owner_recognizer_facenet import FaceNetOwnerRecognizer, cosine_distance
 from enhanced_tracking import (
-    MotionPredictor, ObstacleDetector,
+    MotionPredictor,
     BodyguardConfig, EnhancedPersonTracker, PersonReIDStore,
     draw_angle_indicator, draw_confidence_bar
 )
@@ -139,12 +143,13 @@ WEAPON_CLASSES = {"knife", "gun", "baseball_bat", "hammer"}
 ENTRY_THRESHOLDS = config.entry_thresholds
 KEEP_THRESHOLDS = config.keep_thresholds
 
-# Keep wrong boxes from lingering on screen. Normal non-owner person tracks get
-# only a tiny prediction grace, while the owner keeps a slightly longer one.
+# Demo tuning: bias toward smoother person continuity in sparse scenes.
+# Keep wrong boxes from lingering on screen, but allow a slightly longer grace
+# so blur / brief occlusion does not instantly drop the box.
 OBJECT_MISSING_FRAMES = config.object_missing_frames
-NON_OWNER_PREDICTION_FRAMES = 2
-OWNER_PREDICTION_FRAMES = 6
-MIN_SEEN_FRAMES_FOR_PREDICTION = 3
+NON_OWNER_PREDICTION_FRAMES = 24  # lock: keep non-owner box for ~0.8 s without detection
+OWNER_PREDICTION_FRAMES = 60      # lock: keep owner box for ~2.0 s without detection
+MIN_SEEN_FRAMES_FOR_PREDICTION = 2
 OBJECT_MISSING_FRAMES = min(OBJECT_MISSING_FRAMES, 2)
 
 CLASS_CONFIRM_FRAMES = {
@@ -208,7 +213,7 @@ MIN_OWNER_FACE_SIZE = config.min_owner_face_size
 # Both mean-embedding distance AND best-sample distance must clear this threshold.
 # 0.30 = FaceNetOwnerRecognizer's own default (enrolled samples score 0.02–0.15,
 # live match ~0.20–0.28, strangers typically 0.45+).
-FACENET_STRICT_THRESHOLD = 0.30
+FACENET_STRICT_THRESHOLD = 0.35
 
 
 # -----------------------------
@@ -241,14 +246,15 @@ owner_recognizer = FaceNetOwnerRecognizer(threshold=OWNER_DISTANCE_THRESHOLD)
 # Enhanced tracking components
 enhanced_tracker = EnhancedPersonTracker(config)
 
-# Ultralytics ByteTrack defaults, mirroring the official bytetrack.yaml config.
+# Demo-tuned ByteTrack settings: prefer continuity over strictness in
+# low-crowd scenes so people survive blur, weak lighting, and short occlusion.
 BYTE_TRACKER_ARGS = SimpleNamespace(
     tracker_type="bytetrack",
-    track_high_thresh=0.20,
-    track_low_thresh=0.10,
-    new_track_thresh=0.15,
-    track_buffer=30 if not config.rpi_mode else 60,
-    match_thresh=0.80,
+    track_high_thresh=0.15,
+    track_low_thresh=0.07,
+    new_track_thresh=0.10,
+    track_buffer=45 if not config.rpi_mode else 75,
+    match_thresh=0.90,        # More permissive matching for demo continuity
     fuse_score=True,
 )
 byte_tracker = BYTETracker(BYTE_TRACKER_ARGS, frame_rate=CAM_FPS)
@@ -256,9 +262,6 @@ byte_tracker = BYTETracker(BYTE_TRACKER_ARGS, frame_rate=CAM_FPS)
 # Face-based re-identification store.
 # One job: face embedding → stable display ID.
 reid_store = PersonReIDStore()
-
-# Fallback display-ID counter for persons whose face was never seen
-obstacle_detector = ObstacleDetector()
 
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -292,6 +295,13 @@ last_yolo_result_seq = -1
 # Per-person grayscale crop cache — used to detect whether a person
 # moved since the last frame before running expensive MediaPipe models.
 person_prev_crops = {}   # track_id -> grayscale crop (numpy array)
+
+# Face-concealment streak: how many consecutive frames MTCNN failed to find a
+# face in the upper region of this person's box while they were facing the camera.
+# THREAT is only raised after FACE_CONCEALED_MIN_FRAMES consecutive frames so
+# that one missed detection (motion blur, glance away) does not trigger an alert.
+face_concealed_streak = {}   # track_id -> int
+FACE_CONCEALED_MIN_FRAMES = 4
 
 
 # -----------------------------
@@ -759,7 +769,7 @@ def run_owner_recognition_in_yolo_boxes(frame):
 
     # ── Step 2 & 3: for each detected face, match to a person box, embed, check ─
     for box, prob in zip(boxes_det, probs_det if probs_det is not None else []):
-        if prob is None or prob < 0.85:
+        if prob is None or prob < 0.70:
             continue
 
         bx1, by1, bx2, by2 = [int(v) for v in box]
@@ -814,6 +824,17 @@ def run_owner_recognition_in_yolo_boxes(frame):
         else:
             matched_pdata["owner_match_streak"] = 0
             matched_pdata["face_confirmed_stranger"] = True   # face visible + not owner → hard block
+
+            # ── REVOKE ownership if a non-owner face is detected inside the
+            # currently locked owner's body box.
+            # Scenario: stranger steps in front of the owner, MTCNN picks up
+            # the stranger's face inside the owner's bounding box, FaceNet
+            # returns UNKNOWN → the person occupying that box is NOT the owner,
+            # so we clear recognized_owner_id immediately rather than letting the
+            # wrong person keep the owner label until their track is lost.
+            if matched_pid == recognized_owner_id:
+                recognized_owner_id = None
+                owner_lock_loss_count = 0
 
         # ── Step 4: lock if streak reached and this isn't already the owner ──
         if (is_owner
@@ -918,7 +939,7 @@ def assign_weapons_to_people(active_persons, active_objects):
 
     confirmed_people = {
         pid: pdata for pid, pdata in active_persons.items()
-        if pdata.get("confirmed", False)
+        if pdata.get("confirmed", False) and pdata.get("source") != "predicted"
     }
 
     confirmed_weapons = {
@@ -1087,6 +1108,8 @@ while True:
             continue
         person_rows.append([float(x1), float(y1), float(x2), float(y2), conf, 0.0])
 
+    current_person_boxes = [row[:4] for row in person_rows]
+
     if person_rows:
         person_boxes = Boxes(np.array(person_rows, dtype=np.float32), frame.shape[:2])
     else:
@@ -1124,12 +1147,56 @@ while True:
             "stable_id": prev.get("stable_id"),
             "identifying": False,
             "face_confirmed_stranger": prev.get("face_confirmed_stranger", False),
+            "last_threat_level": prev.get("last_threat_level", "SAFE"),
+            "last_threat_score": prev.get("last_threat_score", 0.0),
         }
 
         if track_id in enhanced_tracker.fingerprints:
             enhanced_tracker.update_person(track_id, bbox_list, frame, conf)
         else:
             enhanced_tracker.add_person(track_id, bbox_list, frame)
+
+    # ── Re-merge: recover identity when ByteTrack assigns a new ID ──────────
+    # When a person is briefly lost, their old track_id enters the grace period
+    # (predicted boxes below).  When ByteTrack re-detects them it issues a FRESH
+    # track_id — that new entry has no history and starts as "unknown".
+    # This pass checks every brand-new track_id against predicted boxes from the
+    # previous frame.  If the overlap is good enough (IoU ≥ 0.30) we inherit the
+    # old entry's identity, stable_id, and owner state so the person doesn't
+    # reset every time they are briefly occluded.
+    # Also updates recognized_owner_id when the owner returns under a new ID.
+    predicted_prev_pids = {
+        pid for pid, pdata in previous_active_persons.items()
+        if pid not in active_persons and pdata.get("missing", 0) > 0
+    }
+    for new_pid, new_data in list(active_persons.items()):
+        if new_pid in previous_active_persons:
+            continue   # continuous track — no merge needed
+        new_box  = new_data["bbox"]
+        best_iou = 0.0
+        best_old = None
+        for old_pid in predicted_prev_pids:
+            old_box  = previous_active_persons[old_pid]["bbox"]
+            score    = iou(new_box, old_box)
+            if score > best_iou:
+                best_iou = score
+                best_old = old_pid
+        if best_old is not None and best_iou >= 0.30:
+            old_data = previous_active_persons[best_old]
+            # Inherit appearance/history so face recognition can quickly re-confirm.
+            # NEVER inherit the owner lock itself — a stranger walking through the
+            # owner's predicted box position must not steal recognized_owner_id.
+            # Face recognition runs every frame and re-locks within 1-2 frames if
+            # the face genuinely matches.
+            for field in ("stable_id", "owner_distance", "owner_match_streak",
+                          "owner_label", "face_confirmed_stranger", "seen_count",
+                          "last_threat_level", "last_threat_score"):
+                if field in old_data:
+                    active_persons[new_pid][field] = old_data[field]
+            # identity and owner_confirmed stay at defaults ("unknown", False).
+            # recognized_owner_id is NOT re-pointed here; the grace-period predicted
+            # box continues holding the owner label while face recognition verifies.
+            predicted_prev_pids.discard(best_old)
 
     # ── Preserve tracks dropped temporarily by ByteTracker ──────────────────
     # ByteTracker only outputs tracks it can actively match each frame.
@@ -1156,6 +1223,36 @@ while True:
         if missing_count <= grace_frames:
             predicted_box = enhanced_tracker.predict_person_position(old_pid, frame)
             kept_box = predicted_box if predicted_box is not None else old_data["bbox"]
+
+            # Lock invalidation: drop the box if it has drifted entirely off-screen.
+            # This prevents a predicted box from chasing someone who left the frame.
+            fH_lock, fW_lock = frame.shape[:2]
+            lx1, ly1, lx2, ly2 = [int(v) for v in kept_box]
+            if lx2 <= 0 or lx1 >= fW_lock or ly2 <= 0 or ly1 >= fH_lock:
+                person_prev_crops.pop(old_pid, None)
+                face_concealed_streak.pop(old_pid, None)
+                continue  # box is off-screen — release the lock
+
+            # Identity-break: if face recognition recently flagged this locked
+            # track as a confirmed stranger while it held the owner label, the
+            # owner reference was already cleared by run_owner_recognition_in_yolo_boxes.
+            # Mirror that here so the locked box doesn't keep "owner" styling.
+            if old_pid == recognized_owner_id and old_data.get("face_confirmed_stranger", False):
+                recognized_owner_id = None
+                owner_lock_loss_count = 0
+
+            # Drop stale locks once the current YOLO pass no longer sees a person
+            # near the predicted box. Keep the first missing frame to absorb a
+            # single detector hiccup; after that, no support means no person there.
+            has_person_support = any(
+                iou(kept_box, det_box) >= 0.10
+                for det_box in current_person_boxes
+            )
+            if missing_count > 1 and not has_person_support:
+                person_prev_crops.pop(old_pid, None)
+                face_concealed_streak.pop(old_pid, None)
+                continue
+
             active_persons[old_pid] = {
                 **old_data,
                 "bbox": kept_box,
@@ -1163,8 +1260,9 @@ while True:
                 "source": "predicted",
             }
         else:
-            # Truly gone after grace period — clean up crop cache
+            # Truly gone after grace period — clean up per-person caches
             person_prev_crops.pop(old_pid, None)
+            face_concealed_streak.pop(old_pid, None)
 
     enhanced_tracker.cleanup_missing_tracks(active_persons.keys())
 
@@ -1204,10 +1302,10 @@ while True:
     # Owner recognition — every frame on PC; gated on RPi to save CPU.
     # The streak gate inside the function (OWNER_CONFIRM_FRAMES) prevents false
     # locks even at the higher cadence used on PC.
-    _run_recognition_this_frame = (
-        OWNER_RECOGNITION_ENABLED and
-        (not config.rpi_mode or frame_count % OWNER_RECOGNITION_EVERY == 0)
-    )
+    # Run face recognition every frame regardless of Pi mode.
+    # This is the lock-breaker: it must catch a wrong owner label
+    # within 1 frame, not after OWNER_RECOGNITION_EVERY frames.
+    _run_recognition_this_frame = OWNER_RECOGNITION_ENABLED
     if _run_recognition_this_frame:
         run_owner_recognition_in_yolo_boxes(frame)
 
@@ -1342,18 +1440,30 @@ while True:
             if oid in switch_candidate_history:
                 switch_candidate_history[oid].clear()
 
-            if active_objects[oid]["missing"] > OBJECT_MISSING_FRAMES:
+            # If the weapon's last known holder is still being tracked, double
+            # the expiry window — the weapon is likely just momentarily occluded
+            # by the person's body or a pose change.
+            holder_pid   = active_objects[oid].get("holder_pid")
+            holder_alive = holder_pid is not None and holder_pid in active_persons
+            ttl = OBJECT_MISSING_FRAMES * 2 if holder_alive else OBJECT_MISSING_FRAMES
+
+            if active_objects[oid]["missing"] > ttl:
                 del active_objects[oid]
                 if oid in object_class_history:
                     del object_class_history[oid]
                 if oid in switch_candidate_history:
                     del switch_candidate_history[oid]
 
-    # --- Obstacle Detection ---
-    obstacle, obstacle_area = obstacle_detector.get_nearest_obstacle(frame, raw_detections)
-
     # --- Global weapon ownership ---
     weapon_assignments = assign_weapons_to_people(active_persons, active_objects)
+
+    # Store holder_pid back into active_objects so the next frame's expiry
+    # check can extend grace when the holder person is still being tracked.
+    for pid, weapons in weapon_assignments.items():
+        for w in weapons:
+            oid = w.get("object_id")
+            if oid is not None and oid in active_objects:
+                active_objects[oid]["holder_pid"] = pid
 
     threat_analyzer.cleanup_missing_tracks(active_persons.keys())
 
@@ -1385,13 +1495,10 @@ while True:
 
         pbox = person_data["bbox"]
         assigned_weapons = weapon_assignments.get(pid, [])
-
         is_real_owner = (pid == recognized_owner_id)
         identity = "owner" if is_real_owner else "unknown"
+        is_predicted = person_data.get("source") == "predicted"
 
-        # Per-person pixel change: check if this person visibly moved since
-        # the last frame. If not, MediaPipe models will use cached results
-        # (no re-inference needed — saves significant CPU on RPi).
         if len(pbox) != 4:
             print(f"[ERROR] Invalid bbox for person {pid}: {pbox}")
             continue
@@ -1401,71 +1508,109 @@ while True:
         x2c = max(0, min(x2c, fW - 1))
         y1c = max(0, min(y1c, fH - 1))
         y2c = max(0, min(y2c, fH - 1))
-        person_moved = True
-        if x2c > x1c and y2c > y1c:
-            crop_gray = cv2.cvtColor(frame[y1c:y2c, x1c:x2c], cv2.COLOR_BGR2GRAY)
-            prev_crop  = person_prev_crops.get(pid)
-            if prev_crop is not None and prev_crop.shape == crop_gray.shape:
-                diff     = cv2.absdiff(crop_gray, prev_crop)
-                ch_ratio = np.count_nonzero(diff > 20) / max(1, diff.size)
-                person_moved = ch_ratio > PERSON_MOVEMENT_THRESHOLD
-            person_prev_crops[pid] = crop_gray
-        person_data["person_moved"] = person_moved
 
-        # ── Aggression: run as an INDEPENDENT step on its own cadence ──────────
-        # update_aggression() rate-limits internally (every N frames) and caches
-        # the result. analyze_person() below just reads the cache — so the two
-        # pipelines run at different frequencies without coupling.
-        if identity != "owner":
-            threat_analyzer.update_aggression(
-                frame, pid, pbox, frame_count, person_moved=person_moved
-            )
+        if is_predicted:
+            # ── Predicted (locked) box ─────────────────────────────────────────
+            # The box position is motion-extrapolated and may be stale.
+            # Skip all expensive analysis (aggression, pose, mask, threat detectors)
+            # to avoid false positives from a box that doesn't reflect reality.
+            # Use the threat state cached from the last real detection frame.
+            threat_level = person_data.get("last_threat_level", "SAFE")
+            threat_score = person_data.get("last_threat_score", 0.0)
+            explanation  = [f"LOCKED({person_data.get('missing', 0)})"]
+            debug        = {}
+            mask_result  = {"mask": False, "label": "UNKNOWN"}
+            person_moved = False
+        else:
+            # ── Per-person pixel change (movement gate) ────────────────────────
+            # Minimum crop change needed before re-running MediaPipe models.
+            person_moved = True
+            if x2c > x1c and y2c > y1c:
+                crop_gray = cv2.cvtColor(frame[y1c:y2c, x1c:x2c], cv2.COLOR_BGR2GRAY)
+                prev_crop  = person_prev_crops.get(pid)
+                if prev_crop is not None and prev_crop.shape == crop_gray.shape:
+                    diff     = cv2.absdiff(crop_gray, prev_crop)
+                    ch_ratio = np.count_nonzero(diff > 20) / max(1, diff.size)
+                    person_moved = ch_ratio > PERSON_MOVEMENT_THRESHOLD
+                person_prev_crops[pid] = crop_gray
+            person_data["person_moved"] = person_moved
 
-        # ── Mask / face-concealment detection ────────────────────────────────
-        # Crop the upper 45 % of the person box (where the face is) and check
-        # whether MTCNN can find a face. No face → concealed → immediate THREAT.
-        # Only checked for non-owners; owner box is always trusted.
-        mask_result = {"mask": False, "label": "UNKNOWN"}
-        if identity != "owner" and mask_detector.enabled:
-            face_y2 = y1c + int((y2c - y1c) * 0.45)
-            face_crop = frame[y1c:face_y2, x1c:x2c] if face_y2 > y1c else None
-            if face_crop is not None and face_crop.size > 0:
-                mask_result = mask_detector.detect(
-                    face_crop, person_box_height=(y2c - y1c)
+            # ── Aggression ────────────────────────────────────────────────────
+            if identity != "owner":
+                threat_analyzer.update_aggression(
+                    frame, pid, pbox, frame_count, person_moved=person_moved
                 )
 
-        person = {
-            "id": pid,
-            "bbox": pbox,
-            "identity": identity,
-            "weapons": assigned_weapons,
-        }
+            # ── Mask / face-concealment detection ─────────────────────────────
+            mask_result = {"mask": False, "label": "UNKNOWN"}
+            if identity != "owner" and mask_detector.enabled:
+                face_y2 = y1c + int((y2c - y1c) * 0.45)
+                face_crop = frame[y1c:face_y2, x1c:x2c] if face_y2 > y1c else None
+                if face_crop is not None and face_crop.size > 0:
+                    mask_result = mask_detector.detect(
+                        face_crop, person_box_height=(y2c - y1c)
+                    )
 
-        context = {
-            "mode": "indoor",
-            "owner_present": effective_owner_id in active_persons,
-            "time_of_day": "day",
-            "owner_bbox": owner_bbox,
-            "owner_id": effective_owner_id,
-        }
+            person = {
+                "id": pid,
+                "bbox": pbox,
+                "identity": identity,
+                "weapons": assigned_weapons,
+            }
 
-        threat_level, threat_score, explanation, debug = threat_analyzer.analyze_person(
-            frame,
-            person,
-            context,
-            frame_index=frame_count,
-            person_moved=person_moved,
-        )
+            context = {
+                "mode": "indoor",
+                "owner_present": effective_owner_id in active_persons,
+                "time_of_day": "day",
+                "owner_bbox": owner_bbox,
+                "owner_id": effective_owner_id,
+            }
 
-        # Masked person overrides whatever threat_analyzer returned.
-        if mask_result.get("mask") and identity != "owner":
-            threat_level  = "THREAT"
-            threat_score  = 95.0
-            explanation   = ["FACE_CONCEALED"]
+            threat_level, threat_score, explanation, debug = threat_analyzer.analyze_person(
+                frame,
+                person,
+                context,
+                frame_index=frame_count,
+                person_moved=person_moved,
+            )
 
-        if len(pbox) != 4:
-            print(f"[ERROR] Invalid bbox for drawing person {pid}: {pbox}")
-            continue
+            # ── Punch / slap → THREAT ─────────────────────────────────────────
+            # Same check as test_behavior_analyzer_live.py:
+            #   behavior_analyzer returns "Punching/slapping" in behaviors
+            #   ↔  stabilized attack_motion = True
+            # Only fires for unknown persons when the owner is in the frame.
+            if identity != "owner" and owner_bbox is not None:
+                ba_signals = threat_analyzer.behavior_analyzer.get_pose_signals(
+                    pid, stabilized=True
+                )
+                if ba_signals.get("attack_motion", False):
+                    threat_level = "THREAT"
+                    threat_score = 92.0
+                    explanation  = ["ATTACK_MOTION"]
+
+            # Cache so predicted-box frames can reuse the last real result
+            person_data["last_threat_level"] = threat_level
+            person_data["last_threat_score"] = threat_score
+
+            # ── Face-concealment threat gate ───────────────────────────────────
+            if identity != "owner" and owner_bbox is not None and mask_result.get("mask"):
+                _pose_lm      = threat_analyzer.get_pose_landmarks(pid)
+                _nose_vis     = 0.0
+                if _pose_lm is not None and len(_pose_lm) > 0:
+                    _nose_vis = getattr(_pose_lm[0], 'visibility', 0.0)
+                _facing_camera = _nose_vis >= 0.5
+                if _facing_camera:
+                    face_concealed_streak[pid] = face_concealed_streak.get(pid, 0) + 1
+                else:
+                    face_concealed_streak[pid] = 0
+            else:
+                face_concealed_streak[pid] = 0
+
+            if face_concealed_streak.get(pid, 0) >= FACE_CONCEALED_MIN_FRAMES:
+                threat_level = "SUSPICIOUS"
+                threat_score = 60.0
+                explanation  = ["FACE_CONCEALED"]
+
         x1, y1, x2, y2 = [int(v) for v in pbox]
 
         if is_real_owner:
@@ -1493,6 +1638,10 @@ while True:
                 f"weapon: {'yes' if debug.get('has_weapon') else 'no'}"
             )
             info_lines.append(f"face: {mask_result.get('label', 'UNKNOWN')}")
+            info_lines.append(
+                f"attack_motion: {debug.get('attack_motion', False)} | "
+                f"raw: {debug.get('attack_motion_raw', False)}"
+            )
 
         info_lines.append(f"person_conf: {person_data['conf']:.2f}")
         info_lines.append(f"source: {person_data.get('source', 'yolo')}")
