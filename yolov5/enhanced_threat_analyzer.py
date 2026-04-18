@@ -959,9 +959,9 @@ class EnhancedThreatAnalyzer:
                 "attack_motion_raw":   raw_pose_signals.get("attack_motion", False),
             }
 
-            # ── Owner is always SAFE ──────────────────────────────────────────
-            if identity == "owner":
-                return "SAFE", 0.0, ["OWNER"], _dbg
+            # ── Owner and enrolled family members are always SAFE ────────────
+            if identity in ("owner", "family_member"):
+                return "SAFE", 0.0, ["OWNER" if identity == "owner" else "FAMILY"], _dbg
 
             # ── Unknown without owner in frame → SAFE ─────────────────────────
             if not owner_present:

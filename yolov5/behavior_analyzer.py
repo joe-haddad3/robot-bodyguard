@@ -246,7 +246,11 @@ class BehaviorAnalyzer:
 
         stable = {}
         window = list(history)
-        quick_signals = {"single_arm_high", "wrist_fast", "swinging_arm", "strike_windup", "punch_detected", "attack_motion"}
+        # quick_signals fire on a single positive frame (fast transients).
+        # punch_detected / attack_motion are NOT quick — they must appear in
+        # at least 2 of the last 5 frames so that a single noisy frame cannot
+        # trigger a THREAT.  A real punch sustains the signal for 3–5 frames.
+        quick_signals = {"single_arm_high", "wrist_fast", "swinging_arm", "strike_windup"}
         for key in self._empty_pose_flags():
             positives = sum(1 for item in window if item.get(key, False))
             if key in quick_signals:
@@ -326,8 +330,7 @@ class BehaviorAnalyzer:
         #   swinging_arm    — fast wrist moving INWARD (hook / slap); outward raises blocked
         # forward_arm, single_arm_high, and strike_windup alone no longer suffice because
         # they all fire for a simple T-pose or arm raise.
-        # Only a confirmed punch-like motion counts as attack_motion.
-        attack_motion = punch_detected
+        attack_motion = punch_detected or (wrist_fast and swinging_arm)
 
         lunge = crouch and torso_lean and (forward_arm or head_lowered or attack_motion)
 
@@ -445,10 +448,10 @@ class BehaviorAnalyzer:
         l_sh = self._landmark_to_global(landmarks[LEFT_SHOULDER], pose_bbox)
         r_sh = self._landmark_to_global(landmarks[RIGHT_SHOULDER], pose_bbox)
         shoulder_width = max(40.0, abs(l_sh[0] - r_sh[0]))
-        wrist_speed_thresh = max(24.0, shoulder_width * 0.30)
-        swing_thresh = max(18.0, shoulder_width * 0.25)
-        extension_gain_thresh = max(8.0, shoulder_width * 0.10)
-        extension_len_thresh = max(70.0, shoulder_width * 0.95)
+        wrist_speed_thresh    = max(28.0, shoulder_width * 0.35)   # ~35 % shoulder_width / frame
+        swing_thresh          = max(22.0, shoulder_width * 0.28)   # horizontal speed for hook/slap
+        extension_gain_thresh = max(10.0, shoulder_width * 0.12)   # arm must be actively extending
+        extension_len_thresh  = max(80.0, shoulder_width * 1.00)   # arm must be nearly fully extended
 
         any_fast = False
         any_swing = False
@@ -496,21 +499,18 @@ class BehaviorAnalyzer:
                 and wrist_inward          # must move toward center, not outward
             )
 
-            # punch_like: fast wrist + arm extending + wrist at strike height
-            # Height guard: wrist must be near shoulder level (not hanging at waist).
-            #   swing_like already has this guard; punch_like needs it too.
-            #   Raising arms from the waist puts the wrist 150-200 px below the
-            #   shoulder — well outside the 0.9 * shoulder_width allowance.
-            # Direction guard: a punch/slap is mostly horizontal — abs(rel_dx)
-            #   must be at least 40% of abs(rel_dy) so a straight upward lift
-            #   (large rel_dy, tiny rel_dx) is rejected.
+            # punch_like: straight punch / jab
+            #   • wrist must be at or near shoulder height (not hanging at waist)
+            #     — arm raises from waist put the wrist far below the shoulder
+            #   • motion must be mostly horizontal (a punch goes FORWARD, not UP)
+            #     — pure vertical lifts have large rel_dy and tiny rel_dx
             punch_like = (
                 wrist_fast
                 and arm_span >= extension_len_thresh
                 and extension_gain >= extension_gain_thresh
                 and wrist_inward
-                and wrist[1] <= shoulder[1] + shoulder_width * 0.9   # near shoulder height
-                and abs(rel_dx) >= abs(rel_dy) * 0.4                  # not a pure vertical lift
+                and wrist[1] <= shoulder[1] + shoulder_width * 0.9   # wrist at/near shoulder height
+                and abs(rel_dx) >= abs(rel_dy) * 0.5                  # at least 50 % horizontal
             )
 
             any_fast = any_fast or wrist_fast or punch_like

@@ -33,3 +33,7 @@ thop>=0.1.1
 # Tracking
 ultralytics>=8.4.14
 lap>=0.5.13
+
+# Enrollment REST server
+flask>=3.0.0
+onnxruntime>=1.17.0          # optional but strongly recommended on RPi for faster FaceNet

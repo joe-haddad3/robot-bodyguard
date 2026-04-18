@@ -313,12 +313,13 @@ class BodyguardConfig:
     def update_for_rpi(self):
         """Update settings for Raspberry Pi performance"""
         self.rpi_mode = True
+        # Favor owner-recognition reliability over the more aggressive low-res mode.
         self.camera_width = 640
         self.camera_height = 480
         self.camera_fps = 15
-        self.yolo_every_n_frames = 2   # async thread; 640×480 is fast enough at this rate
-        self.owner_recognition_every = 2  # run face recognition every 2 frames on Pi
-        self.min_owner_face_size = 25
+        self.yolo_every_n_frames = 3
+        self.owner_recognition_every = 4
+        self.min_owner_face_size = 20
 
 
 # ---------------------------

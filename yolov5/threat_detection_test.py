@@ -15,7 +15,7 @@ from collections import deque, defaultdict
 
 from enhanced_threat_analyzer import EnhancedThreatAnalyzer
 from camera_utils import LatestFrameCamera, make_camera
-from owner_recognizer_facenet import FaceNetOwnerRecognizer, cosine_distance
+from multi_person_recognizer import MultiPersonRecognizer, cosine_distance
 from enhanced_tracking import (
     MotionPredictor,
     BodyguardConfig, EnhancedPersonTracker, PersonReIDStore,
@@ -23,6 +23,7 @@ from enhanced_tracking import (
 )
 from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics.engine.results import Boxes
+import shared_state
 
 # Helper to distinguish which recognizer is active without circular imports
 # “Try to get the attribute recognizer_type from the object”
@@ -34,14 +35,22 @@ def _is_clip(recognizer):
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
+import platform as _platform
+
+# Auto-detect Raspberry Pi (ARM CPU or device-tree model file present)
+_IS_RPI = (
+    os.path.exists("/proc/device-tree/model") or
+    _platform.machine() in ("aarch64", "armv7l", "armv6l")
+)
+
 config = BodyguardConfig()
-if config.rpi_mode:
+if _IS_RPI:
     config.update_for_rpi()
 
-# Override with local settings
-CAM_W = config.camera_width
-CAM_H = config.camera_height
-CAM_FPS = config.camera_fps
+# C270 webcam supports 640×480 @ 30 fps — use full 30 fps regardless of mode
+CAM_W   = config.camera_width
+CAM_H   = config.camera_height
+CAM_FPS = 30
 YOLO_EVERY = config.yolo_every_n_frames if config.rpi_mode else 1
 
 # Camera settings
@@ -172,7 +181,12 @@ CLASS_PRIORITY = {
 FACE_MIN_SIZE = (60, 60)
 
 # How often (frames) to try extracting face embeddings for persons who don't have one yet
-FACE_UPDATE_EVERY = 15
+FACE_UPDATE_EVERY = 30
+
+# Face detection (Haar/MTCNN box finding) runs every frame.
+# FaceNet embedding + identification only runs every N frames — expensive on Pi.
+FACE_RECOGNITION_EVERY = 5 if config.rpi_mode else 1
+_face_recog_counter    = 0
 
 # Minimum pixel change ratio WITHIN a person's bounding box crop
 # required to re-run MediaPipe models on that person.
@@ -239,9 +253,15 @@ owner_lock_loss_count = 0
 owner_profile = None
 owner_prediction_streak = 0  # Consecutive frames maintained by prediction
 
+# track_id → identify result dict for enrolled non-owner persons (family members)
+recognized_trusted_ids: dict = {}
+
+# track_id → last alert time (unix seconds) — 30-second cooldown per person
+alert_cooldowns: dict = {}
+
 # Recovery confirmation — require the same candidate to match N consecutive
 # frames before promoting them to recognized_owner_id.  Prevents a single
-owner_recognizer = FaceNetOwnerRecognizer(threshold=OWNER_DISTANCE_THRESHOLD)
+multi_recognizer = MultiPersonRecognizer(threshold=OWNER_DISTANCE_THRESHOLD)
 
 # Enhanced tracking components
 enhanced_tracker = EnhancedPersonTracker(config)
@@ -268,21 +288,25 @@ face_cascade = cv2.CascadeClassifier(
 )
 
 # MTCNN — used only in the owner recognition path so embeddings match enrollment.
-try:
-    from facenet_pytorch import MTCNN as _MTCNN
-    _mtcnn_recognizer = _MTCNN(
-        image_size=160,
-        margin=20,
-        keep_all=False,
-        min_face_size=MIN_OWNER_FACE_SIZE,
-        thresholds=[0.6, 0.7, 0.7],
-        post_process=False,
-        device="cpu",
-    )
-    print("[INIT] MTCNN loaded — owner recognition will use aligned face crops (matches enrollment)")
-except Exception as _e:
+if config.rpi_mode:
     _mtcnn_recognizer = None
-    print(f"[INIT] MTCNN unavailable ({_e}) — falling back to Haar for face crops")
+    print("[INIT] RPi mode: using Haar fallback for face crops to reduce latency")
+else:
+    try:
+        from facenet_pytorch import MTCNN as _MTCNN
+        _mtcnn_recognizer = _MTCNN(
+            image_size=160,
+            margin=20,
+            keep_all=False,
+            min_face_size=MIN_OWNER_FACE_SIZE,
+            thresholds=[0.6, 0.7, 0.7],
+            post_process=False,
+            device="cpu",
+        )
+        print("[INIT] MTCNN loaded — owner recognition will use aligned face crops (matches enrollment)")
+    except Exception as _e:
+        _mtcnn_recognizer = None
+        print(f"[INIT] MTCNN unavailable ({_e}) — falling back to Haar for face crops")
 
 # Mask / face-concealment detector
 from mask_detector import MaskDetector
@@ -373,10 +397,31 @@ def iou(boxA, boxB):
     return interArea / denom
 
 
+def owner_track_changed_enough(prev_box, curr_box):
+    """Return True when the owner's box moved enough to justify faster face checks."""
+    prev_center = bbox_center(prev_box)
+    curr_center = bbox_center(curr_box)
+    center_shift = distance(prev_center, curr_center)
+    owner_scale = max(40.0, 0.5 * (bbox_height(curr_box) + bbox_width(curr_box)))
+    size_ratio = abs(bbox_height(curr_box) - bbox_height(prev_box)) / max(1.0, bbox_height(prev_box))
+    return center_shift > owner_scale * 0.12 or size_ratio > 0.10 or iou(prev_box, curr_box) < 0.65
+
+
 def point_in_box(pt, box):
     x, y = pt
     x1, y1, x2, y2 = box
     return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def get_confirmed_weapon_names(weapons):
+    """Return confirmed weapon classes that pass the threat thresholds."""
+    confirmed = []
+    for weapon in weapons:
+        cls = weapon.get("class_name")
+        conf = float(weapon.get("conf", 0.0))
+        if cls in threat_analyzer.WEAPON_WEIGHTS and conf >= threat_analyzer.WEAPON_THRESHOLDS.get(cls, 0.50):
+            confirmed.append(cls)
+    return confirmed
 
 
 def class_id_to_name(cls_id):
@@ -401,6 +446,40 @@ def draw_text_block(frame, lines, x, y, color):
                 color,
                 1
             )
+
+
+def draw_boxed_label(
+    frame,
+    text,
+    x,
+    y,
+    bg_color,
+    text_color=(255, 255, 255),
+    font_scale=0.50,
+    thickness=1,
+    padding=4,
+):
+    """Draw a filled label box with text anchored near the top-left of a bbox."""
+    (text_w, text_h), baseline = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+    )
+    text_y = max(text_h + padding + baseline, y)
+    top_left = (max(0, x - padding), max(0, text_y - text_h - padding))
+    bottom_right = (
+        min(frame.shape[1] - 1, x + text_w + padding),
+        min(frame.shape[0] - 1, text_y + baseline + padding),
+    )
+    cv2.rectangle(frame, top_left, bottom_right, bg_color, -1)
+    cv2.putText(
+        frame,
+        text,
+        (x, text_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        text_color,
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 def match_detection_to_tracks(det_box, tracks, iou_threshold=0.20, dist_threshold=250, skip_ids=None, frame=None):
@@ -636,13 +715,78 @@ def match_faces_to_persons(detected_faces, persons):
     return assignments
 
 
+def _face_tensor_to_embedding(face_tensor):
+    """Convert an MTCNN-aligned face tensor into the same embedding format used at enrollment."""
+    import torch as _torch
+    from multi_person_recognizer import l2_normalize as _l2
+
+    face_np = face_tensor.numpy().transpose(1, 2, 0)  # (160,160,3) in [0,255]
+    face_np = (face_np / 255.0 - 0.5) / 0.5
+    face_np = face_np.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+
+    if multi_recognizer._session is not None:
+        emb = multi_recognizer._session.run(None, {multi_recognizer._input_name: face_np})[0][0]
+    elif multi_recognizer._pt_model is not None:
+        with _torch.no_grad():
+            emb = multi_recognizer._pt_model(_torch.from_numpy(face_np)).cpu().numpy()[0]
+    else:
+        return None
+    return _l2(emb)
+
+
+def _extract_aligned_face_embedding(face_bgr):
+    """
+    Build a runtime embedding from a face crop using the same alignment path as enrollment.
+    Returns (embedding, aligned_face_rgb) or (None, None) when no usable face is found.
+    """
+    if not multi_recognizer._registry or face_bgr is None or face_bgr.size == 0:
+        return None, None
+
+    if _mtcnn_recognizer is not None:
+        from PIL import Image as _PIL_Image
+        try:
+            pil_crop = _PIL_Image.fromarray(cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB))
+            face_tensor = _mtcnn_recognizer(pil_crop)
+            if face_tensor is not None:
+                emb = _face_tensor_to_embedding(face_tensor)
+                aligned_rgb = np.clip(
+                    face_tensor.numpy().transpose(1, 2, 0), 0, 255
+                ).astype(np.uint8)
+                return emb, aligned_rgb
+        except RuntimeError as e:
+            print(f"[DEBUG] MTCNN aligned face extraction skipped: {e}")
+        except Exception as e:
+            print(f"[DEBUG] Aligned face extraction error skipped: {e}")
+
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 3, minSize=(20, 20))
+    if len(faces) == 0:
+        return None, None
+
+    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+    if fw < MIN_OWNER_FACE_SIZE or fh < MIN_OWNER_FACE_SIZE:
+        return None, None
+
+    pad_x = int(fw * FACE_EXPAND)
+    pad_y = int(fh * FACE_EXPAND)
+    fc = face_bgr[
+        max(0, fy - pad_y):min(face_bgr.shape[0], fy + fh + pad_y),
+        max(0, fx - pad_x):min(face_bgr.shape[1], fx + fw + pad_x),
+    ]
+    if fc.size == 0:
+        return None, None
+
+    face_rgb = cv2.cvtColor(fc, cv2.COLOR_BGR2RGB)
+    return multi_recognizer.embed_face_rgb(face_rgb), face_rgb
+
+
 def _try_extract_face_emb(frame, box):
     """
     Try to find a face in the upper 55 % of a person box and return its FaceNet embedding.
     Uses MTCNN when available (matches enrollment alignment); falls back to Haar.
     Returns a (512,) float32 numpy array, or None if no face was found.
     """
-    if not owner_recognizer.enabled:
+    if not multi_recognizer._registry:
         return None
     x1, y1, x2, y2 = (int(v) for v in box)
     H, W = frame.shape[:2]
@@ -658,75 +802,30 @@ def _try_extract_face_emb(frame, box):
         return None
     if crop.shape[0] < max(20, MIN_OWNER_FACE_SIZE // 2) or crop.shape[1] < max(20, MIN_OWNER_FACE_SIZE // 2):
         return None
-
-    if _mtcnn_recognizer is not None:
-        from PIL import Image as _PIL_Image
-        try:
-            pil_crop = _PIL_Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-            face_tensor = _mtcnn_recognizer(pil_crop)
-            if face_tensor is None:
-                return None
-            # face_tensor: (3, 160, 160) raw pixel values [0,255] — normalise to [-1,1] for FaceNet
-            import torch as _torch
-            face_np = face_tensor.numpy().transpose(1, 2, 0)  # (160,160,3)
-            face_np = (face_np / 255.0 - 0.5) / 0.5
-            face_np = face_np.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
-            if owner_recognizer._session is not None:
-                emb = owner_recognizer._session.run(None, {owner_recognizer._input_name: face_np})[0][0]
-            elif owner_recognizer._pt_model is not None:
-                with _torch.no_grad():
-                    emb = owner_recognizer._pt_model(_torch.from_numpy(face_np)).cpu().numpy()[0]
-            else:
-                return None
-            from owner_recognizer_facenet import l2_normalize as _l2
-            return _l2(emb)
-        except RuntimeError as e:
-            # facenet_pytorch MTCNN can throw on crops where no valid candidate face survives.
-            print(f"[DEBUG] MTCNN face extraction skipped: {e}")
-            return None
-        except Exception as e:
-            print(f"[DEBUG] Face extraction error skipped: {e}")
-            return None
-
-    # Haar fallback
-    gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.1, 3, minSize=(20, 20))
-    if len(faces) == 0:
-        return None
-    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-    if fw < MIN_OWNER_FACE_SIZE or fh < MIN_OWNER_FACE_SIZE:
-        return None
-    pad_x = int(fw * FACE_EXPAND)
-    pad_y = int(fh * FACE_EXPAND)
-    fc = crop[max(0, fy - pad_y):min(crop.shape[0], fy + fh + pad_y),
-               max(0, fx - pad_x):min(crop.shape[1], fx + fw + pad_x)]
-    if fc.size == 0:
-        return None
-    return owner_recognizer.embed_face_rgb(cv2.cvtColor(fc, cv2.COLOR_BGR2RGB))
+    emb, _ = _extract_aligned_face_embedding(crop)
+    return emb
 
 
 def run_owner_recognition_in_yolo_boxes(frame):
     """
-    Owner face recognition — exact same logic as test_owner_recognition.py.
+    Multi-person face recognition — two-phase design for Pi performance:
 
-    1. Run MTCNN on the full frame (not a sub-crop) to detect all faces.
-    2. For each detected face, find which tracked person box it belongs to.
-    3. Crop the face + padding, embed with FaceNet, dual-check vs threshold —
-       identical to the test script.
-    4. If owner confirmed for OWNER_CONFIRM_FRAMES consecutive frames → lock.
-
+    Phase 1 (every frame): Haar/MTCNN face detection → updates face_box_global
+                           so the yellow face rectangle is always fresh on screen.
+    Phase 2 (every FACE_RECOGNITION_EVERY frames): FaceNet embed + identify →
+                           updates owner lock, family-member trust, stranger flag.
     """
-    global recognized_owner_id, owner_profile, owner_lock_loss_count
+    global recognized_owner_id, owner_profile, owner_lock_loss_count, _face_recog_counter
 
-    if not OWNER_RECOGNITION_ENABLED or not owner_recognizer.enabled:
+    if not OWNER_RECOGNITION_ENABLED:
         return
+
+    _face_recog_counter += 1
+    do_recognition = bool(multi_recognizer._registry) and (_face_recog_counter % FACE_RECOGNITION_EVERY == 0)
 
     H, W = frame.shape[:2]
 
     # ── Step 1: MTCNN on (optionally downscaled) frame ───────────────────────
-    # At 720p (1280×720) MTCNN processes 3× more pixels than at 640×480.
-    # Downscale to a max width of 640 px before detection; scale detected boxes
-    # back up so they align with the original-resolution person boxes.
     _MTCNN_MAX_W = 640
     if W > _MTCNN_MAX_W:
         _scale = _MTCNN_MAX_W / W
@@ -740,13 +839,11 @@ def run_owner_recognition_in_yolo_boxes(frame):
 
     if _mtcnn_recognizer is not None:
         boxes_det, probs_det = _mtcnn_recognizer.detect(pil_frame)
-        # Scale boxes back to original resolution
         if boxes_det is not None and _scale != 1.0:
             boxes_det = [[v / _scale for v in b] for b in boxes_det]
     else:
-        # Haar fallback — detect in full frame
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        haar_faces = face_cascade.detectMultiScale(gray_full, 1.1, 4, minSize=(40, 40))
+        haar_faces = face_cascade.detectMultiScale(gray_full, 1.1, 4, minSize=(24, 24))
         if len(haar_faces) > 0:
             boxes_det = [[x, y, x+w, y+h] for (x, y, w, h) in haar_faces]
             probs_det = [1.0] * len(haar_faces)
@@ -758,7 +855,6 @@ def run_owner_recognition_in_yolo_boxes(frame):
         pdata["face_box_global"] = None
 
     if boxes_det is None or len(boxes_det) == 0:
-        # No faces in frame — gently decay streaks so one missed frame doesn't reset
         for pdata in active_persons.values():
             pdata["owner_match_streak"] = max(0, pdata.get("owner_match_streak", 0) - 1)
         return
@@ -767,32 +863,40 @@ def run_owner_recognition_in_yolo_boxes(frame):
     best_dist      = 999.0
     best_face_crop = None
 
-    # ── Step 2 & 3: for each detected face, match to a person box, embed, check ─
+    detected_faces = []
     for box, prob in zip(boxes_det, probs_det if probs_det is not None else []):
         if prob is None or prob < 0.70:
             continue
 
         bx1, by1, bx2, by2 = [int(v) for v in box]
-        face_cx = (bx1 + bx2) // 2
-        face_cy = (by1 + by2) // 2
+        detected_faces.append({
+            "face_box": (bx1, by1, bx2, by2),
+            "center": ((bx1 + bx2) / 2, (by1 + by2) / 2),
+        })
 
-        # Find the tracked person whose box contains this face centre
-        matched_pid  = None
-        matched_pdata = None
-        for pid, pdata in active_persons.items():
-            if not pdata.get("confirmed", False):
-                continue
-            px1, py1, px2, py2 = [int(v) for v in pdata["bbox"]]
-            upper_y2 = py1 + int((py2 - py1) * 0.70)
-            if px1 <= face_cx <= px2 and py1 <= face_cy <= upper_y2:
-                matched_pid   = pid
-                matched_pdata = pdata
-                break
+    face_assignments = match_faces_to_persons(detected_faces, active_persons)
+    if not face_assignments:
+        for pdata in active_persons.values():
+            pdata["owner_match_streak"] = max(0, pdata.get("owner_match_streak", 0) - 1)
+        return
+    assigned_pids = set(face_assignments.keys())
+    for pid, pdata in active_persons.items():
+        if pid not in assigned_pids:
+            pdata["owner_match_streak"] = max(0, pdata.get("owner_match_streak", 0) - 1)
 
-        if matched_pid is None:
+    # ── Step 2 & 3: embed each face, identify, update per-person state ───────
+    for matched_pid, face in face_assignments.items():
+        matched_pdata = active_persons.get(matched_pid)
+        if matched_pdata is None:
             continue
+        bx1, by1, bx2, by2 = [int(v) for v in face["face_box"]]
 
-        # Crop face + padding — exact same as test_owner_recognition.py
+        # Phase 1 complete: face box is now visible on screen every frame
+        matched_pdata["face_box_global"] = (bx1, by1, bx2, by2)
+
+        if not do_recognition:
+            continue   # skip FaceNet this frame — detection-only pass
+
         pad  = 15
         cfx1 = max(0, bx1 - pad); cfy1 = max(0, by1 - pad)
         cfx2 = min(W, bx2 + pad); cfy2 = min(H, by2 + pad)
@@ -800,58 +904,60 @@ def run_owner_recognition_in_yolo_boxes(frame):
         if face_bgr.size == 0:
             continue
 
-        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-        emb      = owner_recognizer.embed_face_rgb(face_rgb)
+        emb, aligned_face_rgb = _extract_aligned_face_embedding(face_bgr)
+        if emb is None:
+            emb = _try_extract_face_emb(frame, matched_pdata["bbox"])
+            if emb is not None:
+                aligned_face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        if emb is None:
+            matched_pdata["owner_distance"] = 999.0
+            continue
 
-        # Dual check — exact same as test_owner_recognition.py
-        mean_dist = (
-            cosine_distance(emb, owner_recognizer.mean_embedding)
-            if owner_recognizer.mean_embedding is not None else 999.0
-        )
-        sample_dists     = [cosine_distance(emb, ref) for ref in owner_recognizer.owner_embeddings]
-        best_sample_dist = min(sample_dists) if sample_dists else 999.0
+        result   = multi_recognizer.identify_from_embedding(emb)
 
-        is_owner = (mean_dist < FACENET_STRICT_THRESHOLD and
-                    best_sample_dist < FACENET_STRICT_THRESHOLD)
+        role     = result.get("role", "unknown")
+        matched  = result.get("matched", False)
+        dist     = result.get("distance", 999.0)
+        is_owner = matched and role == "owner"
+        is_family = matched and role == "family_member"
 
-        matched_pdata["face_box_global"] = (bx1, by1, bx2, by2)
-        matched_pdata["owner_distance"]  = float(mean_dist)
-        matched_pdata["owner_label"]     = "OWNER" if is_owner else "UNKNOWN"
+        matched_pdata["owner_distance"]  = float(dist)
 
         if is_owner:
-            matched_pdata["owner_match_streak"] = matched_pdata.get("owner_match_streak", 0) + 1
-            matched_pdata["face_confirmed_stranger"] = False  # face says owner — clear block
+            matched_pdata["owner_label"]           = "OWNER"
+            matched_pdata["owner_match_streak"]    = matched_pdata.get("owner_match_streak", 0) + 1
+            matched_pdata["face_confirmed_stranger"] = False
+        elif is_family:
+            matched_pdata["owner_label"]           = result.get("name", "FAMILY")
+            matched_pdata["owner_match_streak"]    = 0
+            matched_pdata["face_confirmed_stranger"] = False
+            recognized_trusted_ids[matched_pid]    = result
         else:
-            matched_pdata["owner_match_streak"] = 0
-            matched_pdata["face_confirmed_stranger"] = True   # face visible + not owner → hard block
-
-            # ── REVOKE ownership if a non-owner face is detected inside the
-            # currently locked owner's body box.
-            # Scenario: stranger steps in front of the owner, MTCNN picks up
-            # the stranger's face inside the owner's bounding box, FaceNet
-            # returns UNKNOWN → the person occupying that box is NOT the owner,
-            # so we clear recognized_owner_id immediately rather than letting the
-            # wrong person keep the owner label until their track is lost.
+            matched_pdata["owner_label"]           = "UNKNOWN"
+            matched_pdata["owner_match_streak"]    = 0
+            matched_pdata["face_confirmed_stranger"] = True
+            # Revoke owner lock if a non-owner face is inside the locked owner box
             if matched_pid == recognized_owner_id:
-                recognized_owner_id = None
+                recognized_owner_id  = None
                 owner_lock_loss_count = 0
+            # Clear trusted status if face now identified as stranger
+            recognized_trusted_ids.pop(matched_pid, None)
 
-        # ── Step 4: lock if streak reached and this isn't already the owner ──
+        # ── Step 4: lock owner after streak ──────────────────────────────────
         if (is_owner
                 and matched_pid != recognized_owner_id
                 and matched_pdata["owner_match_streak"] >= OWNER_CONFIRM_FRAMES
-                and mean_dist < best_dist):
-            best_dist      = mean_dist
+                and dist < best_dist):
+            best_dist      = dist
             best_pid       = matched_pid
-            best_face_crop = face_rgb
+            best_face_crop = aligned_face_rgb
 
-        # Update reid store for all persons with a visible face
         stable_id = matched_pdata.get("stable_id")
         if stable_id:
             reid_store.update_face(stable_id, emb)
 
     if best_pid is not None:
-        recognized_owner_id  = best_pid
+        recognized_owner_id   = best_pid
         owner_lock_loss_count = 0
         owner_profile = build_owner_profile(
             active_persons[best_pid]["bbox"], best_face_crop
@@ -865,7 +971,7 @@ def run_owner_recognition_in_yolo_boxes(frame):
             active_persons[best_pid]["stable_id"] = owner_stable
         if owner_stable:
             reid_store.mark_owner(owner_stable)
-        print(f"[OWNER] Locked pid={best_pid}  mean={best_dist:.3f}")
+        print(f"[OWNER] Locked pid={best_pid}  dist={best_dist:.3f}")
         for pid in active_persons:
             active_persons[pid]["owner_confirmed"] = (pid == recognized_owner_id)
             active_persons[pid]["identity"] = "owner" if pid == recognized_owner_id else "unknown"
@@ -878,8 +984,8 @@ def build_owner_profile(box, face_rgb=None):
         "last_seen_frame": frame_count,
         "lost_frames": 0,
     }
-    if face_rgb is not None and owner_recognizer.enabled:
-        profile["face_embedding"] = owner_recognizer.embed_face_rgb(face_rgb)
+    if face_rgb is not None and multi_recognizer._registry:
+        profile["face_embedding"] = multi_recognizer.embed_face_rgb(face_rgb)
     return profile
 
 
@@ -891,8 +997,8 @@ def update_owner_profile(box, face_rgb=None):
     owner_profile["last_seen_box"] = box
     owner_profile["last_seen_frame"] = frame_count
     owner_profile["lost_frames"] = 0
-    if face_rgb is not None and owner_recognizer.enabled:
-        owner_profile["face_embedding"] = owner_recognizer.embed_face_rgb(face_rgb)
+    if face_rgb is not None and multi_recognizer._registry:
+        owner_profile["face_embedding"] = multi_recognizer.embed_face_rgb(face_rgb)
 
 
 def make_hand_zone(person_box):
@@ -1064,8 +1170,32 @@ def ensure_active_person_track(track_id, box, conf, source="bytetrack", frame=No
 # -----------------------------
 WINDOW_NAME = "Enhanced Threat Detection"
 DISPLAY_W, DISPLAY_H = 640, 480  # fixed display size regardless of capture resolution
+HEADLESS = not bool(os.environ.get("DISPLAY", ""))
+
+# -----------------------------
+# FLASK API SERVER (daemon thread)
+# Starts the enrollment + detection API on port 5000 so the mobile app
+# can connect while the detection loop runs in the main thread.
+# -----------------------------
+import enrollment_server as _enrollment_server
+_flask_thread = threading.Thread(
+    target=lambda: _enrollment_server.app.run(
+        host="0.0.0.0", port=5000, use_reloader=False, threaded=True
+    ),
+    daemon=True,
+)
+_flask_thread.start()
+print("[INIT] Flask API server started on port 5000")
+
+ALERT_COOLDOWN_SECONDS = 30
+
+print("[INIT] Waiting for app to send POST /api/v1/start ...")
 
 while True:
+    if not shared_state.is_running():
+        time.sleep(0.1)
+        continue
+
     frame = cam.read()
     if frame is None:
         time.sleep(0.01)
@@ -1193,6 +1323,9 @@ while True:
                           "last_threat_level", "last_threat_score"):
                 if field in old_data:
                     active_persons[new_pid][field] = old_data[field]
+            trusted_info = recognized_trusted_ids.pop(best_old, None)
+            if trusted_info is not None:
+                recognized_trusted_ids[new_pid] = trusted_info
             # identity and owner_confirmed stay at defaults ("unknown", False).
             # recognized_owner_id is NOT re-pointed here; the grace-period predicted
             # box continues holding the owner label while face recognition verifies.
@@ -1263,6 +1396,8 @@ while True:
             # Truly gone after grace period — clean up per-person caches
             person_prev_crops.pop(old_pid, None)
             face_concealed_streak.pop(old_pid, None)
+            recognized_trusted_ids.pop(old_pid, None)
+            alert_cooldowns.pop(old_pid, None)
 
     enhanced_tracker.cleanup_missing_tracks(active_persons.keys())
 
@@ -1299,20 +1434,21 @@ while True:
     # Tick ReID store to age out stale lost records
     reid_store.tick()
 
-    # Owner recognition — every frame on PC; gated on RPi to save CPU.
-    # The streak gate inside the function (OWNER_CONFIRM_FRAMES) prevents false
-    # locks even at the higher cadence used on PC.
-    # Run face recognition every frame regardless of Pi mode.
-    # This is the lock-breaker: it must catch a wrong owner label
-    # within 1 frame, not after OWNER_RECOGNITION_EVERY frames.
-    _run_recognition_this_frame = OWNER_RECOGNITION_ENABLED
-    if _run_recognition_this_frame:
+    # Security mode split:
+    #   HOME -> keep the "full" owner-recognition path active all the time so
+    #           owner/family labels stay current and the owner lock can break
+    #           immediately if the visible face changes.
+    #   AWAY -> still run face recognition whenever persons are present, but the
+    #           downstream policy is stricter: any visible unknown person becomes
+    #           an immediate THREAT.
+    current_security_mode = shared_state.get_mode()
+    if OWNER_RECOGNITION_ENABLED and active_persons:
         run_owner_recognition_in_yolo_boxes(frame)
 
     # Sync identity labels
     # IMPROVED: Add temporal consistency to prevent rapid owner switching
     effective_owner_id = recognized_owner_id if recognized_owner_id in active_persons else None
-    
+
     # Track owner stability - don't switch owner too frequently
     if effective_owner_id != recognized_owner_id:
         if recognized_owner_id is not None:
@@ -1321,21 +1457,33 @@ while True:
         else:
             # No current owner, can assign more easily
             pass
-    
+
     for pid in active_persons:
         if pid == recognized_owner_id:
             active_persons[pid]["identity"] = "owner"
             active_persons[pid]["owner_confirmed"] = True
+        elif pid in recognized_trusted_ids:
+            active_persons[pid]["identity"] = "family_member"
+            active_persons[pid]["owner_confirmed"] = False
         else:
             active_persons[pid]["identity"] = "unknown"
             active_persons[pid]["owner_confirmed"] = False
 
+    # Push owner presence to shared_state so Flask API stays up to date
+    owner_in_frame = (effective_owner_id is not None)
+    shared_state.set_owner_present(owner_in_frame)
+
     # If no persons are being tracked, show a minimal overlay and skip Phase 2
     if not active_persons:
         cv2.putText(frame, "No persons detected", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-        cv2.imshow(WINDOW_NAME, cv2.resize(frame, (DISPLAY_W, DISPLAY_H)) if frame.shape[1] != DISPLAY_W or frame.shape[0] != DISPLAY_H else frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+        _empty = cv2.resize(frame, (DISPLAY_W, DISPLAY_H)) if frame.shape[1] != DISPLAY_W or frame.shape[0] != DISPLAY_H else frame
+        _ok, _jpg = cv2.imencode(".jpg", _empty, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if _ok:
+            shared_state.update_frame(_jpg.tobytes())
+        if not HEADLESS:
+            cv2.imshow(WINDOW_NAME, _empty)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
         continue
 
     # =========================================================
@@ -1496,7 +1644,12 @@ while True:
         pbox = person_data["bbox"]
         assigned_weapons = weapon_assignments.get(pid, [])
         is_real_owner = (pid == recognized_owner_id)
-        identity = "owner" if is_real_owner else "unknown"
+        is_trusted = (pid in recognized_trusted_ids)
+        identity = (
+            "owner" if is_real_owner
+            else "family_member" if is_trusted
+            else "unknown"
+        )
         is_predicted = person_data.get("source") == "predicted"
 
         if len(pbox) != 4:
@@ -1536,14 +1689,14 @@ while True:
             person_data["person_moved"] = person_moved
 
             # ── Aggression ────────────────────────────────────────────────────
-            if identity != "owner":
+            if identity not in ("owner", "family_member"):
                 threat_analyzer.update_aggression(
                     frame, pid, pbox, frame_count, person_moved=person_moved
                 )
 
             # ── Mask / face-concealment detection ─────────────────────────────
             mask_result = {"mask": False, "label": "UNKNOWN"}
-            if identity != "owner" and mask_detector.enabled:
+            if identity not in ("owner", "family_member") and mask_detector.enabled:
                 face_y2 = y1c + int((y2c - y1c) * 0.45)
                 face_crop = frame[y1c:face_y2, x1c:x2c] if face_y2 > y1c else None
                 if face_crop is not None and face_crop.size > 0:
@@ -1559,7 +1712,7 @@ while True:
             }
 
             context = {
-                "mode": "indoor",
+                "mode": current_security_mode.lower(),
                 "owner_present": effective_owner_id in active_persons,
                 "time_of_day": "day",
                 "owner_bbox": owner_bbox,
@@ -1579,7 +1732,7 @@ while True:
             #   behavior_analyzer returns "Punching/slapping" in behaviors
             #   ↔  stabilized attack_motion = True
             # Only fires for unknown persons when the owner is in the frame.
-            if identity != "owner" and owner_bbox is not None:
+            if identity not in ("owner", "family_member") and owner_bbox is not None:
                 ba_signals = threat_analyzer.behavior_analyzer.get_pose_signals(
                     pid, stabilized=True
                 )
@@ -1588,12 +1741,8 @@ while True:
                     threat_score = 92.0
                     explanation  = ["ATTACK_MOTION"]
 
-            # Cache so predicted-box frames can reuse the last real result
-            person_data["last_threat_level"] = threat_level
-            person_data["last_threat_score"] = threat_score
-
             # ── Face-concealment threat gate ───────────────────────────────────
-            if identity != "owner" and owner_bbox is not None and mask_result.get("mask"):
+            if identity not in ("owner", "family_member") and owner_bbox is not None and mask_result.get("mask"):
                 _pose_lm      = threat_analyzer.get_pose_landmarks(pid)
                 _nose_vis     = 0.0
                 if _pose_lm is not None and len(_pose_lm) > 0:
@@ -1611,10 +1760,55 @@ while True:
                 threat_score = 60.0
                 explanation  = ["FACE_CONCEALED"]
 
+            # ── AWAY mode: any unknown person is an automatic THREAT ──────────
+            # In HOME mode we keep the full owner-recognition / behavior-driven
+            # pipeline. In AWAY mode we switch to stricter visitor screening:
+            # if a visible person is not recognized as the owner or a trusted
+            # family member, they are immediately escalated.
+            confirmed_weapon_names = get_confirmed_weapon_names(assigned_weapons)
+            if identity not in ("owner", "family_member") and owner_bbox is not None and confirmed_weapon_names:
+                threat_level = "THREAT"
+                threat_score = 95.0
+                explanation  = [f"ARMED_UNKNOWN_WITH_OWNER:{'/'.join(confirmed_weapon_names)}"]
+
+            current_mode = shared_state.get_mode()
+            if identity not in ("owner", "family_member"):
+                if current_mode == "AWAY":
+                    threat_level = "THREAT"
+                    threat_score = 95.0
+                    explanation  = ["UNKNOWN_PERSON_AWAY_MODE"]
+
+        # Cache so predicted-box frames can reuse the last real result
+        if is_trusted:
+            trusted_name = recognized_trusted_ids.get(pid, {}).get("name", "Family Member")
+            threat_level = "SAFE"
+            threat_score = 0.0
+            explanation = [f"FAMILY_MEMBER:{trusted_name}"]
+
+        person_data["last_threat_level"] = threat_level
+        person_data["last_threat_score"] = threat_score
+
+        # ── Alert generation (30-second cooldown per track) ───────────────────
+        if identity not in ("owner", "family_member") and threat_level in ("THREAT", "SUSPICIOUS"):
+            _now = time.time()
+            _last = alert_cooldowns.get(pid, 0.0)
+            if _now - _last >= ALERT_COOLDOWN_SECONDS:
+                alert_cooldowns[pid] = _now
+                _trusted_info = recognized_trusted_ids.get(pid, {})
+                shared_state.add_alert(
+                    level=threat_level,
+                    person_id=_trusted_info.get("person_id", f"track_{pid}"),
+                    name=_trusted_info.get("name", "Unknown"),
+                    explanation=explanation,
+                    track_id=pid,
+                )
+
         x1, y1, x2, y2 = [int(v) for v in pbox]
 
         if is_real_owner:
             color = (255, 255, 0)
+        elif is_trusted:
+            color = (0, 0, 0)   # black box for family member
         else:
             color = (0, 255, 0)
             if threat_level == "SUSPICIOUS":
@@ -1625,12 +1819,30 @@ while True:
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if is_real_owner else 2)
 
         display_id = person_data.get('stable_id') or pid
-        main_label = "OWNER" if is_real_owner else f"ID {display_id} | {threat_level} {threat_score:.1f}"
-        cv2.putText(frame, main_label, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        if is_real_owner:
+            main_label = "OWNER"
+        elif is_trusted:
+            _tname = recognized_trusted_ids[pid].get("name", "FAMILY")
+            main_label = f"FAMILY MEMBER: {_tname}"
+        else:
+            main_label = f"ID {display_id} | {threat_level} {threat_score:.1f}"
+        if is_trusted:
+            draw_boxed_label(
+                frame,
+                main_label,
+                x1,
+                max(20, y1 - 10),
+                bg_color=(0, 0, 0),
+                text_color=(255, 255, 255),
+                font_scale=0.52,
+                thickness=1,
+            )
+        else:
+            cv2.putText(frame, main_label, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
         info_lines = []
 
-        if not is_real_owner:
+        if not is_real_owner and not is_trusted:
             info_lines.append(f"threat: {threat_score:.1f} | {', '.join(explanation)}")
             info_lines.append(
                 f"aggr: {debug.get('aggression_score', 0.0):.2f} | "
@@ -1702,11 +1914,19 @@ while True:
         1,
     )
 
-    cv2.imshow(WINDOW_NAME, cv2.resize(frame, (DISPLAY_W, DISPLAY_H)) if frame.shape[1] != DISPLAY_W or frame.shape[0] != DISPLAY_H else frame)
+    display_frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H)) if frame.shape[1] != DISPLAY_W or frame.shape[0] != DISPLAY_H else frame
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27:
-        break
+    # Stream annotated frame to shared_state so the Flask /api/v1/stream endpoint
+    # can serve it as MJPEG to the mobile app.
+    _ok, _jpg = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if _ok:
+        shared_state.update_frame(_jpg.tobytes())
+
+    if not HEADLESS:
+        cv2.imshow(WINDOW_NAME, display_frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
 
 cam.stop()
-cv2.destroyAllWindows()
+if not HEADLESS:
+    cv2.destroyAllWindows()
