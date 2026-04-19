@@ -256,6 +256,9 @@ owner_prediction_streak = 0  # Consecutive frames maintained by prediction
 # track_id → identify result dict for enrolled non-owner persons (family members)
 recognized_trusted_ids: dict = {}
 
+# track_id → identify result dict for persons enrolled as known threats
+recognized_threat_ids: dict = {}
+
 # track_id → last alert time (unix seconds) — 30-second cooldown per person
 alert_cooldowns: dict = {}
 
@@ -915,33 +918,42 @@ def run_owner_recognition_in_yolo_boxes(frame):
 
         result   = multi_recognizer.identify_from_embedding(emb)
 
-        role     = result.get("role", "unknown")
-        matched  = result.get("matched", False)
-        dist     = result.get("distance", 999.0)
-        is_owner = matched and role == "owner"
+        role      = result.get("role", "unknown")
+        matched   = result.get("matched", False)
+        dist      = result.get("distance", 999.0)
+        is_owner  = matched and role == "owner"
         is_family = matched and role == "family_member"
+        is_threat = matched and role == "threat"
 
-        matched_pdata["owner_distance"]  = float(dist)
+        matched_pdata["owner_distance"] = float(dist)
 
         if is_owner:
-            matched_pdata["owner_label"]           = "OWNER"
-            matched_pdata["owner_match_streak"]    = matched_pdata.get("owner_match_streak", 0) + 1
+            matched_pdata["owner_label"]             = "OWNER"
+            matched_pdata["owner_match_streak"]      = matched_pdata.get("owner_match_streak", 0) + 1
             matched_pdata["face_confirmed_stranger"] = False
+            recognized_threat_ids.pop(matched_pid, None)
         elif is_family:
-            matched_pdata["owner_label"]           = result.get("name", "FAMILY")
-            matched_pdata["owner_match_streak"]    = 0
+            matched_pdata["owner_label"]             = result.get("name", "FAMILY")
+            matched_pdata["owner_match_streak"]      = 0
             matched_pdata["face_confirmed_stranger"] = False
-            recognized_trusted_ids[matched_pid]    = result
+            recognized_trusted_ids[matched_pid]      = result
+            recognized_threat_ids.pop(matched_pid, None)
+        elif is_threat:
+            matched_pdata["owner_label"]             = result.get("name", "THREAT")
+            matched_pdata["owner_match_streak"]      = 0
+            matched_pdata["face_confirmed_stranger"] = True
+            recognized_threat_ids[matched_pid]       = result
+            recognized_trusted_ids.pop(matched_pid, None)
         else:
-            matched_pdata["owner_label"]           = "UNKNOWN"
-            matched_pdata["owner_match_streak"]    = 0
+            matched_pdata["owner_label"]             = "UNKNOWN"
+            matched_pdata["owner_match_streak"]      = 0
             matched_pdata["face_confirmed_stranger"] = True
             # Revoke owner lock if a non-owner face is inside the locked owner box
             if matched_pid == recognized_owner_id:
-                recognized_owner_id  = None
+                recognized_owner_id   = None
                 owner_lock_loss_count = 0
-            # Clear trusted status if face now identified as stranger
             recognized_trusted_ids.pop(matched_pid, None)
+            recognized_threat_ids.pop(matched_pid, None)
 
         # ── Step 4: lock owner after streak ──────────────────────────────────
         if (is_owner
@@ -1185,6 +1197,7 @@ _flask_thread = threading.Thread(
     daemon=True,
 )
 _flask_thread.start()
+_enrollment_server.set_live_recognizer(multi_recognizer)
 print("[INIT] Flask API server started on port 5000")
 
 ALERT_COOLDOWN_SECONDS = 30
@@ -1397,6 +1410,7 @@ while True:
             person_prev_crops.pop(old_pid, None)
             face_concealed_streak.pop(old_pid, None)
             recognized_trusted_ids.pop(old_pid, None)
+            recognized_threat_ids.pop(old_pid, None)
             alert_cooldowns.pop(old_pid, None)
 
     enhanced_tracker.cleanup_missing_tracks(active_persons.keys())
@@ -1464,6 +1478,9 @@ while True:
             active_persons[pid]["owner_confirmed"] = True
         elif pid in recognized_trusted_ids:
             active_persons[pid]["identity"] = "family_member"
+            active_persons[pid]["owner_confirmed"] = False
+        elif pid in recognized_threat_ids:
+            active_persons[pid]["identity"] = "known_threat"
             active_persons[pid]["owner_confirmed"] = False
         else:
             active_persons[pid]["identity"] = "unknown"
@@ -1644,10 +1661,12 @@ while True:
         pbox = person_data["bbox"]
         assigned_weapons = weapon_assignments.get(pid, [])
         is_real_owner = (pid == recognized_owner_id)
-        is_trusted = (pid in recognized_trusted_ids)
+        is_trusted    = (pid in recognized_trusted_ids)
+        is_known_threat = (pid in recognized_threat_ids)
         identity = (
-            "owner" if is_real_owner
+            "owner"        if is_real_owner
             else "family_member" if is_trusted
+            else "known_threat"  if is_known_threat
             else "unknown"
         )
         is_predicted = person_data.get("source") == "predicted"
@@ -1778,12 +1797,18 @@ while True:
                     threat_score = 95.0
                     explanation  = ["UNKNOWN_PERSON_AWAY_MODE"]
 
+            # Known-threat override: always max threat regardless of other signals
+            if identity == "known_threat":
+                threat_level = "THREAT"
+                threat_score = 99.0
+                explanation  = ["KNOWN_THREAT_PERSON", recognized_threat_ids[pid].get("name", "")]
+
         # Cache so predicted-box frames can reuse the last real result
         if is_trusted:
             trusted_name = recognized_trusted_ids.get(pid, {}).get("name", "Family Member")
             threat_level = "SAFE"
             threat_score = 0.0
-            explanation = [f"FAMILY_MEMBER:{trusted_name}"]
+            explanation  = [f"FAMILY_MEMBER:{trusted_name}"]
 
         person_data["last_threat_level"] = threat_level
         person_data["last_threat_score"] = threat_score
@@ -1794,11 +1819,18 @@ while True:
             _last = alert_cooldowns.get(pid, 0.0)
             if _now - _last >= ALERT_COOLDOWN_SECONDS:
                 alert_cooldowns[pid] = _now
-                _trusted_info = recognized_trusted_ids.get(pid, {})
+                if identity == "known_threat":
+                    _tinfo = recognized_threat_ids.get(pid, {})
+                    _alert_person_id = _tinfo.get("person_id", f"track_{pid}")
+                    _alert_name      = _tinfo.get("name", "Known Threat")
+                else:
+                    _tinfo = recognized_trusted_ids.get(pid, {})
+                    _alert_person_id = _tinfo.get("person_id", f"track_{pid}")
+                    _alert_name      = _tinfo.get("name", "Unknown")
                 shared_state.add_alert(
                     level=threat_level,
-                    person_id=_trusted_info.get("person_id", f"track_{pid}"),
-                    name=_trusted_info.get("name", "Unknown"),
+                    person_id=_alert_person_id,
+                    name=_alert_name,
                     explanation=explanation,
                     track_id=pid,
                 )
@@ -1806,9 +1838,11 @@ while True:
         x1, y1, x2, y2 = [int(v) for v in pbox]
 
         if is_real_owner:
-            color = (255, 255, 0)
+            color = (255, 255, 0)          # yellow
         elif is_trusted:
-            color = (0, 0, 0)   # black box for family member
+            color = (0, 0, 0)              # black for family member
+        elif is_known_threat:
+            color = (0, 0, 200)            # dark red for known threat
         else:
             color = (0, 255, 0)
             if threat_level == "SUSPICIOUS":
@@ -1824,6 +1858,9 @@ while True:
         elif is_trusted:
             _tname = recognized_trusted_ids[pid].get("name", "FAMILY")
             main_label = f"FAMILY MEMBER: {_tname}"
+        elif is_known_threat:
+            _kname = recognized_threat_ids[pid].get("name", "THREAT")
+            main_label = f"KNOWN THREAT: {_kname}"
         else:
             main_label = f"ID {display_id} | {threat_level} {threat_score:.1f}"
         if is_trusted:
@@ -1833,6 +1870,17 @@ while True:
                 x1,
                 max(20, y1 - 10),
                 bg_color=(0, 0, 0),
+                text_color=(255, 255, 255),
+                font_scale=0.52,
+                thickness=1,
+            )
+        elif is_known_threat:
+            draw_boxed_label(
+                frame,
+                main_label,
+                x1,
+                max(20, y1 - 10),
+                bg_color=(0, 0, 200),
                 text_color=(255, 255, 255),
                 font_scale=0.52,
                 thickness=1,
