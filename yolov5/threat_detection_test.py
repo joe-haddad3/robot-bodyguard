@@ -12,6 +12,7 @@ import numpy as np
 
 from types import SimpleNamespace
 from collections import deque, defaultdict
+from camera_servo_controller import CameraServoController
 
 from enhanced_threat_analyzer import EnhancedThreatAnalyzer
 from camera_utils import LatestFrameCamera, make_camera
@@ -43,6 +44,60 @@ _IS_RPI = (
     _platform.machine() in ("aarch64", "armv7l", "armv6l")
 )
 
+servo_controller = CameraServoController(
+    port="/dev/ttyUSB0",   # change if your Arduino is on ttyUSB0
+    baud=115200
+)
+servo_controller.center()  # hold at startup — do not move until mode is active
+
+from ugv_base_controller import UGVBaseController
+try:
+    ugv_controller = UGVBaseController(port="/dev/ttyUSB1", baud=115200)
+    print("[INIT] UGV base controller connected on /dev/ttyUSB1")
+except Exception as _ugv_err:
+    ugv_controller = None
+    print(f"[INIT] UGV base unavailable ({_ugv_err}) — robot-body turning disabled")
+def get_box_center_xy(box):
+    x1, y1, x2, y2 = box
+    cx = int((x1 + x2) / 2)
+    cy = int((y1 + y2) / 2)
+    return cx, cy
+
+
+def choose_servo_target(owner_detected, owner_box, top_threat):
+    """
+    Priority:
+    1. top threat
+    2. owner
+    3. no target -> scan
+    """
+
+    if top_threat is not None:
+        # expected keys: cx, cy OR bbox
+        if "cx" in top_threat and "cy" in top_threat:
+            return {
+                "label": "threat",
+                "cx": int(top_threat["cx"]),
+                "cy": int(top_threat["cy"]),
+            }
+
+        if "bbox" in top_threat and top_threat["bbox"] is not None:
+            cx, cy = get_box_center_xy(top_threat["bbox"])
+            return {
+                "label": "threat",
+                "cx": cx,
+                "cy": cy,
+            }
+
+    if owner_detected and owner_box is not None:
+        cx, cy = get_box_center_xy(owner_box)
+        return {
+            "label": "owner",
+            "cx": cx,
+            "cy": cy,
+        }
+
+    return None
 config = BodyguardConfig()
 if _IS_RPI:
     config.update_for_rpi()
@@ -76,7 +131,7 @@ model = torch.hub.load(
 # YOLO confidence threshold is set low so ByteTrack can use lower-confidence
 # boxes during second-stage association, which is the core of why ByteTrack
 # survives blur, partial turns, and brief occlusion better than a naive tracker.
-model.conf = 0.10
+model.conf = 0.06
 
 # -----------------------------
 # ASYNC YOLO RUNNER
@@ -159,7 +214,7 @@ OBJECT_MISSING_FRAMES = config.object_missing_frames
 NON_OWNER_PREDICTION_FRAMES = 24  # lock: keep non-owner box for ~0.8 s without detection
 OWNER_PREDICTION_FRAMES = 60      # lock: keep owner box for ~2.0 s without detection
 MIN_SEEN_FRAMES_FOR_PREDICTION = 2
-OBJECT_MISSING_FRAMES = min(OBJECT_MISSING_FRAMES, 2)
+OBJECT_MISSING_FRAMES = max(OBJECT_MISSING_FRAMES, 10)
 
 CLASS_CONFIRM_FRAMES = {
     "person": 1,
@@ -217,7 +272,7 @@ def _has_motion(frame_bgr):
 # -----------------------------
 OWNER_RECOGNITION_ENABLED = config.owner_recognition_enabled
 OWNER_RECOGNITION_EVERY = config.owner_recognition_every
-OWNER_DISTANCE_THRESHOLD = config.owner_distance_threshold   # enrolled samples score 0.02-0.15 vs mean; live ~2x; strangers ~0.50+
+OWNER_DISTANCE_THRESHOLD = min(config.owner_distance_threshold, 0.25)  # cap at 0.25 — stricter than default so only clear matches pass
 OWNER_CONFIRM_FRAMES = 2                                     # 2 consecutive matches — runs every frame so 2 is already strict
 OWNER_LOST_FRAMES_THRESHOLD = config.owner_lost_frames_threshold
 FACE_EXPAND = config.face_expand
@@ -274,8 +329,8 @@ enhanced_tracker = EnhancedPersonTracker(config)
 BYTE_TRACKER_ARGS = SimpleNamespace(
     tracker_type="bytetrack",
     track_high_thresh=0.15,
-    track_low_thresh=0.07,
-    new_track_thresh=0.10,
+    track_low_thresh=0.05,
+    new_track_thresh=0.07,
     track_buffer=45 if not config.rpi_mode else 75,
     match_thresh=0.90,        # More permissive matching for demo continuity
     fuse_score=True,
@@ -948,12 +1003,11 @@ def run_owner_recognition_in_yolo_boxes(frame):
             matched_pdata["owner_label"]             = "UNKNOWN"
             matched_pdata["owner_match_streak"]      = 0
             matched_pdata["face_confirmed_stranger"] = True
-            # Revoke owner lock if a non-owner face is inside the locked owner box
-            if matched_pid == recognized_owner_id:
-                recognized_owner_id   = None
-                owner_lock_loss_count = 0
-            recognized_trusted_ids.pop(matched_pid, None)
-            recognized_threat_ids.pop(matched_pid, None)
+            # Owner lock is permanent once set — do NOT clear recognized_owner_id here.
+            # It is only cleared when the track_id leaves active_persons entirely.
+            if matched_pid != recognized_owner_id:
+                recognized_trusted_ids.pop(matched_pid, None)
+                recognized_threat_ids.pop(matched_pid, None)
 
         # ── Step 4: lock owner after streak ──────────────────────────────────
         if (is_owner
@@ -1202,10 +1256,93 @@ print("[INIT] Flask API server started on port 5000")
 
 ALERT_COOLDOWN_SECONDS = 30
 
+# -----------------------------
+# SHOOT SEQUENCE (turn body → wait ESP32 done → fire)
+# -----------------------------
+TURN_SPEED          = 0.4   # ESP32 T=1 speed for in-place turn (0.0–1.0)
+TURN_FULL_DURATION  = 4.0   # seconds to rotate ~90° at TURN_SPEED — tune on hardware
+SHOOT_COOLDOWN      = 15.0  # minimum seconds between shots
+
+_shoot_in_progress   = False
+_shot_cooldown_until = 0.0
+
+
+def _run_shoot_sequence(pan_angle):
+    """Background thread: turn robot to align with pan angle, wait for ESP32 ack, shoot."""
+    global _shoot_in_progress, _shot_cooldown_until
+    try:
+        pan_error = pan_angle - 90  # positive → camera pointing left → threat is left → turn left
+                                    # negative → camera pointing right → threat is right → turn right
+        print(f"[SHOOT] Sequence start — pan={pan_angle}°  pan_error={pan_error:.1f}°  ugv={'CONNECTED' if ugv_controller is not None else 'NONE'}")
+
+        if ugv_controller is None:
+            print("[SHOOT] WARNING: ugv_controller is None — check /dev/ttyUSB1 connection. Skipping turn.")
+        elif abs(pan_error) <= 1:
+            print(f"[SHOOT] pan_error={pan_error:.1f}° is within ±1° — no turn needed, robot already aligned.")
+        else:
+            direction     = "left" if pan_error > 0 else "right"
+            turn_duration = abs(pan_error) / 90.0 * TURN_FULL_DURATION
+            turn_duration = max(1.0, min(turn_duration, 6.0))
+            print(f"[SHOOT] Turning {direction} for {turn_duration:.2f}s at speed {TURN_SPEED}")
+
+            ugv_controller.turn_timed(direction, turn_duration, TURN_SPEED)
+            print("[SHOOT] Turn complete — requesting ESP32 feedback")
+
+            # Request base feedback — ESP32 reply is the "done" signal
+            ugv_controller.request_feedback()
+            if ugv_controller.read_response(timeout=2.0):
+                print("[SHOOT] ESP32 ack received")
+            else:
+                print("[SHOOT] ESP32 feedback timeout — proceeding anyway")
+
+        servo_controller._send("SHOOT")
+        print(f"[SHOOT] Fired!")
+    finally:
+        _shot_cooldown_until = time.time() + SHOOT_COOLDOWN
+        _shoot_in_progress   = False
+
+
+_servo_settle_until      = 0.0   # don't track until after this timestamp (post-CENTER)
+_servo_centered_since    = 0.0   # when camera entered deadband; 0 = not yet centered
+_servo_prev_mode         = None  # detect mode switches → send CENTER
+_servo_prev_running      = False # detect login/logout transitions → send CENTER
+_away_no_threat_since    = 0.0   # AWAY: hold camera before resuming scan; 0 = not timing
+_servo_threat_locked     = None  # last confirmed threat {cx, cy}; held briefly after loss
+_servo_threat_lock_until = 0.0   # expiry timestamp for the locked target
+
+# AWAY mode: track when a face was first seen per person so we can wait 3 s
+# before escalating to THREAT (a person box alone is not enough — the system
+# must see a face first and then fail to recognise it as owner/family).
+_away_face_timer: dict = {}  # track_id → time.time() of first face detection
+
 print("[INIT] Waiting for app to send POST /api/v1/start ...")
 
 while True:
-    if not shared_state.is_running():
+    servo_controller.read_position_updates()  # keep self.pan/tilt in sync with Arduino
+    _now_running = shared_state.is_running()
+    _now_mode    = shared_state.get_mode()
+
+    # CENTER on login (False→True) and logout (True→False)
+    if _now_running != _servo_prev_running:
+        servo_controller.center()
+        _servo_settle_until      = time.time() + 1.0
+        _servo_centered_since    = 0.0
+        _away_no_threat_since    = 0.0
+        _servo_threat_locked     = None
+        _servo_threat_lock_until = 0.0
+        _servo_prev_mode         = _now_mode
+        _servo_prev_running      = _now_running
+    # CENTER on mode switch (HOME↔AWAY) — fires even with no persons in frame
+    elif _now_running and _now_mode != _servo_prev_mode:
+        servo_controller.center()
+        _servo_settle_until      = time.time() + 1.0
+        _servo_centered_since    = 0.0
+        _away_no_threat_since    = 0.0
+        _servo_threat_locked     = None
+        _servo_threat_lock_until = 0.0
+        _servo_prev_mode         = _now_mode
+
+    if not _now_running:
         time.sleep(0.1)
         continue
 
@@ -1292,6 +1429,7 @@ while True:
             "face_confirmed_stranger": prev.get("face_confirmed_stranger", False),
             "last_threat_level": prev.get("last_threat_level", "SAFE"),
             "last_threat_score": prev.get("last_threat_score", 0.0),
+            "threat_locked": prev.get("threat_locked", False),
         }
 
         if track_id in enhanced_tracker.fingerprints:
@@ -1333,7 +1471,7 @@ while True:
             # the face genuinely matches.
             for field in ("stable_id", "owner_distance", "owner_match_streak",
                           "owner_label", "face_confirmed_stranger", "seen_count",
-                          "last_threat_level", "last_threat_score"):
+                          "last_threat_level", "last_threat_score", "threat_locked"):
                 if field in old_data:
                     active_persons[new_pid][field] = old_data[field]
             trusted_info = recognized_trusted_ids.pop(best_old, None)
@@ -1379,13 +1517,8 @@ while True:
                 face_concealed_streak.pop(old_pid, None)
                 continue  # box is off-screen — release the lock
 
-            # Identity-break: if face recognition recently flagged this locked
-            # track as a confirmed stranger while it held the owner label, the
-            # owner reference was already cleared by run_owner_recognition_in_yolo_boxes.
-            # Mirror that here so the locked box doesn't keep "owner" styling.
-            if old_pid == recognized_owner_id and old_data.get("face_confirmed_stranger", False):
-                recognized_owner_id = None
-                owner_lock_loss_count = 0
+            # Owner lock is permanent — do not clear recognized_owner_id on stranger
+            # detection; the lock is only released when the track leaves active_persons.
 
             # Drop stale locks once the current YOLO pass no longer sees a person
             # near the predicted box. Keep the first missing frame to absorb a
@@ -1412,6 +1545,7 @@ while True:
             recognized_trusted_ids.pop(old_pid, None)
             recognized_threat_ids.pop(old_pid, None)
             alert_cooldowns.pop(old_pid, None)
+            _away_face_timer.pop(old_pid, None)
 
     enhanced_tracker.cleanup_missing_tracks(active_persons.keys())
 
@@ -1492,6 +1626,21 @@ while True:
 
     # If no persons are being tracked, show a minimal overlay and skip Phase 2
     if not active_persons:
+        _no_person_mode = _servo_prev_mode
+        if _no_person_mode == "AWAY":
+            if _away_no_threat_since == 0.0:
+                # No recent person — scan immediately
+                servo_controller.start_scan()
+            else:
+                # Person recently disappeared — hold 3 s then scan
+                _now_no_person = time.time()
+                if (_now_no_person - _away_no_threat_since) >= 3.0:
+                    servo_controller.start_scan()
+                    _away_no_threat_since = 0.0
+                else:
+                    servo_controller.stop_scan()
+        else:
+            servo_controller.stop_scan()  # HOME: hold position, owner may re-enter
         cv2.putText(frame, "No persons detected", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
         _empty = cv2.resize(frame, (DISPLAY_W, DISPLAY_H)) if frame.shape[1] != DISPLAY_W or frame.shape[0] != DISPLAY_H else frame
         _ok, _jpg = cv2.imencode(".jpg", _empty, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -1654,6 +1803,14 @@ while True:
     # --- Analyze and draw all confirmed persons ---
     owner_bbox = active_persons[effective_owner_id]["bbox"] if effective_owner_id in active_persons else None
 
+    # Servo targeting state for this frame
+    servo_owner_detected = False
+    servo_owner_box = None
+    servo_owner_cx = None   # face-preferred center; falls back to YOLO box center
+    servo_owner_cy = None
+    servo_top_threat = None
+    servo_top_score  = -1.0
+
     for pid, person_data in active_persons.items():
         if not person_data["confirmed"]:
             continue
@@ -1793,9 +1950,17 @@ while True:
             current_mode = shared_state.get_mode()
             if identity not in ("owner", "family_member"):
                 if current_mode == "AWAY":
-                    threat_level = "THREAT"
-                    threat_score = 95.0
-                    explanation  = ["UNKNOWN_PERSON_AWAY_MODE"]
+                    # A person box alone is not enough — a face must be detected
+                    # first.  Once a face is seen, start a 3-second grace window
+                    # so the recogniser has time to confirm owner/family.
+                    # Only after 3 s of unrecognised face do we escalate.
+                    if person_data.get("face_box_global") is not None:
+                        if pid not in _away_face_timer:
+                            _away_face_timer[pid] = time.time()
+                    if pid in _away_face_timer and (time.time() - _away_face_timer[pid]) >= 3.0:
+                        threat_level = "THREAT"
+                        threat_score = 95.0
+                        explanation  = ["UNKNOWN_PERSON_AWAY_MODE"]
 
             # Known-threat override: always max threat regardless of other signals
             if identity == "known_threat":
@@ -1810,8 +1975,43 @@ while True:
             threat_score = 0.0
             explanation  = [f"FAMILY_MEMBER:{trusted_name}"]
 
+        # Identity lock: once a person is confirmed THREAT, never downgrade them
+        if person_data.get("threat_locked", False):
+            threat_level = "THREAT"
+            threat_score = max(float(threat_score), 90.0)
+        elif threat_level == "THREAT":
+            person_data["threat_locked"] = True
+
         person_data["last_threat_level"] = threat_level
         person_data["last_threat_score"] = threat_score
+
+        # Servo target selection for this frame — prefer face box center, fall back to YOLO box
+        if is_real_owner:
+            servo_owner_detected = True
+            servo_owner_box = pbox
+            _owner_fb = person_data.get("face_box_global")
+            if _owner_fb is not None:
+                servo_owner_cx = int((_owner_fb[0] + _owner_fb[2]) / 2)
+                servo_owner_cy = int((_owner_fb[1] + _owner_fb[3]) / 2)
+            else:
+                servo_owner_cx, servo_owner_cy = get_box_center_xy(pbox)
+        elif not is_trusted:
+            if threat_level == "THREAT" and (servo_top_threat is None or threat_score > servo_top_score):
+                _threat_fb = person_data.get("face_box_global")
+                if _threat_fb is not None:
+                    cx_servo = int((_threat_fb[0] + _threat_fb[2]) / 2)
+                    cy_servo = int((_threat_fb[1] + _threat_fb[3]) / 2)
+                else:
+                    cx_servo, cy_servo = get_box_center_xy(pbox)
+                servo_top_threat = {
+                    "id": pid,
+                    "level": threat_level,
+                    "score": float(threat_score),
+                    "bbox": pbox,
+                    "cx": cx_servo,
+                    "cy": cy_servo,
+                }
+                servo_top_score = float(threat_score)
 
         # ── Alert generation (30-second cooldown per track) ───────────────────
         if identity not in ("owner", "family_member") and threat_level in ("THREAT", "SUSPICIOUS"):
@@ -1952,6 +2152,94 @@ while True:
         draw_confidence_bar(frame, owner_conf, x=10, y=60)
 
     summary_owner = f"OWNER ID {recognized_owner_id}" if recognized_owner_id in active_persons else "NONE"
+
+    frame_h, frame_w = frame.shape[:2]
+    _servo_mode = _servo_prev_mode  # kept in sync at top of loop
+    _now_servo  = time.time()
+    _settling   = _now_servo < _servo_settle_until
+
+    # Update threat lock — hold last confirmed position for 0.5 s after YOLO loses it
+    if servo_top_threat is not None:
+        _servo_threat_locked     = {"cx": int(servo_top_threat["cx"]), "cy": int(servo_top_threat["cy"])}
+        _servo_threat_lock_until = _now_servo + 0.5
+    _effective_threat = servo_top_threat if servo_top_threat is not None else (
+        _servo_threat_locked if _now_servo < _servo_threat_lock_until else None
+    )
+
+    if _servo_mode == "HOME":
+        _cx = int(_effective_threat["cx"]) if _effective_threat is not None else None
+
+        servo_controller.stop_scan()
+        if _cx is not None and not _settling:
+            _err_x = _cx - frame_w // 2
+            if abs(_err_x) > 30:
+                servo_controller.track_target(_cx, frame_h // 2, frame_w, frame_h)
+                _servo_centered_since = 0.0
+            else:
+                if _servo_centered_since == 0.0:
+                    _servo_centered_since = _now_servo
+                elif (_now_servo - _servo_centered_since) >= 1.0:
+                    servo_controller.track_target(_cx, frame_h // 2, frame_w, frame_h)
+                    _servo_centered_since = 0.0
+                    if not _shoot_in_progress and _now_servo >= _shot_cooldown_until:
+                        _shoot_in_progress = True
+                        import threading as _th
+                        _th.Thread(target=_run_shoot_sequence,
+                                   args=(servo_controller.pan,), daemon=True).start()
+            _servo_label = "HOME → THREAT"
+        elif _settling:
+            _servo_label = "HOME → SETTLING"
+        else:
+            _servo_centered_since = 0.0
+            _servo_label = "HOME → HOLD"
+    else:
+        if _effective_threat is not None:
+            servo_controller.stop_scan()
+            _away_no_threat_since = 0.0
+            _cx = int(_effective_threat["cx"])
+            if not _settling:
+                _err_x = _cx - frame_w // 2
+                if abs(_err_x) > 30:
+                    servo_controller.track_target(_cx, frame_h // 2, frame_w, frame_h)
+                    _servo_centered_since = 0.0
+                else:
+                    if _servo_centered_since == 0.0:
+                        _servo_centered_since = _now_servo
+                    elif (_now_servo - _servo_centered_since) >= 1.0:
+                        servo_controller.track_target(_cx, frame_h // 2, frame_w, frame_h)
+                        _servo_centered_since = 0.0
+                        if not _shoot_in_progress and _now_servo >= _shot_cooldown_until:
+                            _shoot_in_progress = True
+                            import threading as _th
+                            _th.Thread(target=_run_shoot_sequence,
+                                       args=(servo_controller.pan,), daemon=True).start()
+                _servo_label = "AWAY → THREAT"
+            else:
+                _servo_label = "AWAY → SETTLING"
+        else:
+            # Persons present but none are threats — hold camera 3 s then resume scan
+            servo_controller.stop_scan()
+            if _away_no_threat_since == 0.0:
+                _away_no_threat_since = _now_servo
+            if (_now_servo - _away_no_threat_since) >= 3.0:
+                servo_controller.start_scan()
+                _away_no_threat_since = 0.0
+                _servo_centered_since = 0.0
+                _servo_label = "AWAY → SCAN"
+            else:
+                _secs_left = 3.0 - (_now_servo - _away_no_threat_since)
+                _servo_label = f"AWAY → ANALYZING ({_secs_left:.1f}s)"
+
+    cv2.putText(
+        frame,
+        f"SERVO: {_servo_label}",
+        (10, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 255, 255),
+        1,
+    )
+
     cv2.putText(
         frame,
         f"Owner: {summary_owner}",
@@ -1975,6 +2263,8 @@ while True:
         if cv2.waitKey(1) & 0xFF == 27:
             break
 
+servo_controller.center()
+servo_controller.close()
 cam.stop()
 if not HEADLESS:
     cv2.destroyAllWindows()

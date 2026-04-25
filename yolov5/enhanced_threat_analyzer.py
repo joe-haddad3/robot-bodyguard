@@ -897,6 +897,36 @@ class EnhancedThreatAnalyzer:
             return False
         return self._box_to_box_distance(person_bbox, owner_bbox) < threshold_px
 
+    def _hand_near_owner_face(self, track_id, person_bbox, owner_bbox, pose_landmarks):
+        """
+        Returns True when any wrist or elbow landmark of an unknown person is
+        inside the owner's face zone — regardless of movement speed.
+        Face zone = upper 40% of owner bbox + 25 px margin on all sides.
+        This catches chokes, slaps, punches to the face, and any arm placement
+        near the owner's head.
+        """
+        if owner_bbox is None or not pose_landmarks or len(pose_landmarks) < 14:
+            return False
+
+        ox1, oy1, ox2, oy2 = [float(v) for v in owner_bbox]
+        margin = 25.0
+        face_y_bottom = oy1 + (oy2 - oy1) * 0.40
+        fz = (ox1 - margin, oy1 - margin, ox2 + margin, face_y_bottom + margin)
+
+        pose_bbox = self.behavior_analyzer.get_pose_bbox(track_id) or person_bbox
+
+        for lm_idx in (13, 14, 15, 16):   # left/right elbow, left/right wrist
+            if lm_idx >= len(pose_landmarks):
+                continue
+            vis = getattr(pose_landmarks[lm_idx], 'visibility', 0.0)
+            if vis < 0.30:
+                continue
+            gx, gy = self._landmark_to_global(pose_landmarks[lm_idx], pose_bbox)
+            if fz[0] <= gx <= fz[2] and fz[1] <= gy <= fz[3]:
+                return True
+
+        return False
+
     def analyze_person(self, frame, person, context, frame_index=None, person_moved=True):
         """
         Threat ruleset.
@@ -972,6 +1002,13 @@ class EnhancedThreatAnalyzer:
             # THREAT: holding any confirmed weapon
             if has_weapon:
                 return "THREAT", 85.0, [f"ARMED:{strongest_weapon}"], _dbg
+
+            # THREAT: unknown person's arm/hand inside the owner's face zone
+            # Catches chokes, slaps, punches — regardless of speed.
+            owner_bbox_ctx = context.get("owner_bbox")
+            pose_lm = self.behavior_analyzer.get_pose_landmarks(track_id)
+            if pose_lm and self._hand_near_owner_face(track_id, bbox, owner_bbox_ctx, pose_lm):
+                return "THREAT", 95.0, ["ARM_NEAR_OWNER_FACE"], _dbg
 
             # SUSPICIOUS: aggression state above CALM
             if aggression_state in ("WATCH", "AGGRESSIVE"):
