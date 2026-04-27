@@ -1280,7 +1280,7 @@ def _run_shoot_sequence(pan_angle):
         elif abs(pan_error) <= 1:
             print(f"[SHOOT] pan_error={pan_error:.1f}° is within ±1° — no turn needed, robot already aligned.")
         else:
-            direction     = "left" if pan_error > 0 else "right"
+            direction     = "right" if pan_error > 0 else "left"
             turn_duration = abs(pan_error) / 90.0 * TURN_FULL_DURATION
             turn_duration = max(1.0, min(turn_duration, 6.0))
             print(f"[SHOOT] Turning {direction} for {turn_duration:.2f}s at speed {TURN_SPEED}")
@@ -1295,11 +1295,15 @@ def _run_shoot_sequence(pan_angle):
             else:
                 print("[SHOOT] ESP32 feedback timeout — proceeding anyway")
 
-        servo_controller._send("SHOOT")
-        print(f"[SHOOT] Fired!")
+        _shot_cooldown_until = time.time() + SHOOT_COOLDOWN  # lock out re-trigger immediately
+        for _shot_i in range(5):
+            servo_controller._send("SHOOT")
+            print(f"[SHOOT] Fired! ({_shot_i + 1}/5)")
+            time.sleep(1.0)
+        servo_controller._send("STOP_SHOOT")  # tell Arduino firing is done
+        print("[SHOOT] Sequence complete — 5 shots fired.")
     finally:
-        _shot_cooldown_until = time.time() + SHOOT_COOLDOWN
-        _shoot_in_progress   = False
+        _shoot_in_progress = False
 
 
 _servo_settle_until      = 0.0   # don't track until after this timestamp (post-CENTER)

@@ -2,17 +2,10 @@ import cv2
 
 from behavior_analyzer import (
     BehaviorAnalyzer,
-    NOSE,
-    LEFT_SHOULDER,
-    RIGHT_SHOULDER,
     LEFT_ELBOW,
     RIGHT_ELBOW,
     LEFT_WRIST,
     RIGHT_WRIST,
-    LEFT_HIP,
-    RIGHT_HIP,
-    LEFT_KNEE,
-    RIGHT_KNEE,
 )
 from camera_utils import make_camera
 
@@ -24,48 +17,14 @@ CAM_FPS = 30
 TRACK_ID = 1
 
 KEY_LANDMARKS = [
-    ("nose", NOSE),
-    ("l_sh", LEFT_SHOULDER),
-    ("r_sh", RIGHT_SHOULDER),
     ("l_el", LEFT_ELBOW),
     ("r_el", RIGHT_ELBOW),
     ("l_wr", LEFT_WRIST),
     ("r_wr", RIGHT_WRIST),
-    ("l_hp", LEFT_HIP),
-    ("r_hp", RIGHT_HIP),
-    ("l_kn", LEFT_KNEE),
-    ("r_kn", RIGHT_KNEE),
 ]
 
-POSE_CONNECTIONS = [
-    (LEFT_SHOULDER, RIGHT_SHOULDER),
-    (LEFT_SHOULDER, LEFT_ELBOW),
-    (LEFT_ELBOW, LEFT_WRIST),
-    (RIGHT_SHOULDER, RIGHT_ELBOW),
-    (RIGHT_ELBOW, RIGHT_WRIST),
-    (LEFT_SHOULDER, LEFT_HIP),
-    (RIGHT_SHOULDER, RIGHT_HIP),
-    (LEFT_HIP, RIGHT_HIP),
-    (LEFT_HIP, LEFT_KNEE),
-    (RIGHT_HIP, RIGHT_KNEE),
-]
-
-DEBUG_SIGNALS = [
-    "raised_arms",
-    "single_arm_high",
-    "arm_pose",
-    "forward_arm",
-    "wrist_fast",
-    "swinging_arm",
-    "torso_lean",
-    "crouch",
-    "head_lowered",
-    "strike_windup",
-    "punch_detected",
-    "attack_motion",
-    "lunge",
-    "running",
-]
+FACE_ZONE_MARGIN = 25.0
+FACE_ZONE_HEIGHT_RATIO = 0.40
 
 
 def draw_lines(frame, lines, x, y, color):
@@ -113,16 +72,54 @@ def to_global_points(landmarks, pose_bbox):
     return points
 
 
-def draw_pose_overlay(frame, points):
-    for start_idx, end_idx in POSE_CONNECTIONS:
-        if start_idx in points and end_idx in points:
-            x1, y1, _, _ = points[start_idx]
-            x2, y2, _, _ = points[end_idx]
-            cv2.line(frame, (x1, y1), (x2, y2), (255, 120, 0), 2)
+def make_owner_box(frame_shape):
+    h, w = frame_shape[:2]
+    box_w = int(w * 0.22)
+    box_h = int(h * 0.55)
+    x1 = int(w * 0.08)
+    y1 = int(h * 0.20)
+    return [x1, y1, x1 + box_w, y1 + box_h]
+
+
+def make_face_zone(owner_box):
+    ox1, oy1, ox2, oy2 = [float(v) for v in owner_box]
+    face_bottom = oy1 + (oy2 - oy1) * FACE_ZONE_HEIGHT_RATIO
+    return [
+        int(ox1 - FACE_ZONE_MARGIN),
+        int(oy1 - FACE_ZONE_MARGIN),
+        int(ox2 + FACE_ZONE_MARGIN),
+        int(face_bottom + FACE_ZONE_MARGIN),
+    ]
+
+
+def landmark_hits_face_zone(points, face_zone):
+    fx1, fy1, fx2, fy2 = face_zone
+    hits = []
+    for lm_idx in (LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST):
+        if lm_idx not in points:
+            continue
+        gx, gy, vis, label = points[lm_idx]
+        if vis < 0.30:
+            continue
+        if fx1 <= gx <= fx2 and fy1 <= gy <= fy2:
+            hits.append(label)
+    return hits
+
+
+def draw_pose_overlay(frame, points, hits):
+    if LEFT_ELBOW in points and LEFT_WRIST in points:
+        x1, y1, _, _ = points[LEFT_ELBOW]
+        x2, y2, _, _ = points[LEFT_WRIST]
+        cv2.line(frame, (x1, y1), (x2, y2), (255, 120, 0), 2)
+    if RIGHT_ELBOW in points and RIGHT_WRIST in points:
+        x1, y1, _, _ = points[RIGHT_ELBOW]
+        x2, y2, _, _ = points[RIGHT_WRIST]
+        cv2.line(frame, (x1, y1), (x2, y2), (255, 120, 0), 2)
 
     for gx, gy, vis, label in points.values():
         if 0 <= gx < frame.shape[1] and 0 <= gy < frame.shape[0]:
-            cv2.circle(frame, (gx, gy), 5, (0, 255, 255), -1)
+            color = (0, 0, 255) if label in hits else (0, 255, 255)
+            cv2.circle(frame, (gx, gy), 7, color, -1)
             cv2.putText(
                 frame,
                 label,
@@ -166,40 +163,51 @@ def main():
         display = frame.copy()
         pose_bbox = analyzer.get_pose_bbox(TRACK_ID)
         landmarks = analyzer.get_pose_landmarks(TRACK_ID)
-        stable_signals = analyzer.get_pose_signals(TRACK_ID, stabilized=True)
-        raw_signals = analyzer.get_pose_signals(TRACK_ID, stabilized=False)
+        owner_box = make_owner_box(display.shape)
+        face_zone = make_face_zone(owner_box)
 
         if pose_bbox is not None:
             px1, py1, px2, py2 = [int(v) for v in pose_bbox]
             cv2.rectangle(display, (px1, py1), (px2, py2), (255, 0, 0), 1)
 
         points = to_global_points(landmarks, pose_bbox)
-        if points:
-            draw_pose_overlay(display, points)
+        hits = landmark_hits_face_zone(points, face_zone)
+        threat_detected = bool(hits)
 
-        key_lines = []
-        if points:
-            for gx, gy, vis, label in points.values():
-                key_lines.append(f"{label}: ({gx},{gy}) v={vis:.2f}")
-        else:
-            key_lines.append("pose: no landmarks detected")
+        ox1, oy1, ox2, oy2 = owner_box
+        fx1, fy1, fx2, fy2 = face_zone
+        cv2.rectangle(display, (ox1, oy1), (ox2, oy2), (80, 180, 255), 2)
+        cv2.rectangle(display, (fx1, fy1), (fx2, fy2), (0, 0, 255), 2)
+        cv2.putText(
+            display,
+            "OWNER BOX",
+            (ox1, max(20, oy1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (80, 180, 255),
+            2,
+        )
+        cv2.putText(
+            display,
+            "FACE ZONE",
+            (fx1, max(20, fy1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+        )
 
-        signal_lines = [
-            "stable: " + " ".join(f"{name}={stable_signals[name]}" for name in DEBUG_SIGNALS[:4]),
-            "stable: " + " ".join(f"{name}={stable_signals[name]}" for name in DEBUG_SIGNALS[4:8]),
-            "stable: " + " ".join(f"{name}={stable_signals[name]}" for name in DEBUG_SIGNALS[8:]),
-            "raw: " + " ".join(f"{name}={raw_signals[name]}" for name in DEBUG_SIGNALS[:4]),
-            "raw: " + " ".join(f"{name}={raw_signals[name]}" for name in DEBUG_SIGNALS[4:8]),
-            "raw: " + " ".join(f"{name}={raw_signals[name]}" for name in DEBUG_SIGNALS[8:]),
-        ]
+        if points:
+            draw_pose_overlay(display, points, set(hits))
 
         header = [
-            "mode: full-frame pose only",
-            f"behaviors: {', '.join(behaviors) if behaviors else 'None'}",
-            f"score: {score}",
+            "mode: owner-face proximity test",
+            f"result: {'THREAT' if threat_detected else 'SAFE'}",
+            f"trigger: {', '.join(hits) if hits else 'None'}",
         ]
 
-        draw_lines(display, header + signal_lines + key_lines, 20, 36, (255, 255, 255))
+        result_color = (0, 0, 255) if threat_detected else (0, 255, 0)
+        draw_lines(display, header, 20, 36, result_color)
 
         cv2.imshow(WINDOW_NAME, display)
         key = cv2.waitKey(1) & 0xFF
