@@ -5,3 +5,7 @@ __pycache__/
 *.pyo
 *.pkl
 runs/
+
+# Personal biometric data (enrollment photos and face embeddings): keep local only
+owner_faces/
+yolov5/face_db/
